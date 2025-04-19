@@ -1,0 +1,17 @@
+{
+    "temp_dir": "C:/Users/jarch/discord-screenshotU/tempDownload",
+    "temp_extract_dir": "C:/Users/jarch/discord-screenshotU/tempExtract",
+    "output_dir": "G:/eristaMate/tempOutputLocation",
+    "links_file": "c:\\Users\\jarch\\discord-screenshotU\\src\\config\\links.json",
+    "batch_size": 134,
+    "batch_size_mb": 50000,
+    "copy_timeout": 60,
+    "per_file_timeout": 300,
+    "delete_after_copy": true,
+    "batch_mode": "By Size (MB)",
+    "filter_type": "All",
+    "link_type": "ISO",
+    "iso_size_gb": 20.0666432864964,
+    "xbla_size_gb": 0.0,
+    "last_size_check": "2025-04-19T17:07:44.296110"
+}
