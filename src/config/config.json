@@ -11,7 +11,11 @@
     "batch_mode": "By Size (MB)",
     "filter_type": "All",
     "link_type": "ISO",
-    "iso_size_gb": 20.0666432864964,
+    "iso_size_gb": 8810.30219865311,
     "xbla_size_gb": 0.0,
-    "last_size_check": "2025-04-19T17:07:44.296110"
+    "xbla_addons_size_gb": 0.0,
+    "last_size_check": "2025-04-19T19:25:33.837892",
+    "missing_size_iso": 0,
+    "missing_size_xbla": 0,
+    "missing_size_xbla_addons": 0
 }

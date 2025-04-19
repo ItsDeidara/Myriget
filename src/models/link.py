@@ -4,6 +4,7 @@ import requests
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from queue import Queue
+import shutil
 
 class LinkManager:
     """Manages link processing and JSON operations."""
@@ -17,62 +18,114 @@ class LinkManager:
             os.path.dirname(__file__), "..", "config", "links.json"
         )
     
+    def set_links_file(self, links_file: str) -> None:
+        """Set the links file path."""
+        self.links_file = links_file
+    
+    def _sanitize_game_name(self, url: str) -> str:
+        """Sanitize a game name from URL or filename."""
+        try:
+            # Extract filename from URL and decode URL-encoded characters
+            filename = os.path.basename(url)
+            filename = requests.utils.unquote(filename)  # Decode %20, %28, etc.
+            
+            # Remove file extension
+            name = os.path.splitext(filename)[0]
+            
+            # Replace special characters with spaces
+            name = name.replace('_', ' ').replace('-', ' ').replace('+', ' ')
+            
+            # Remove any numbers or special characters at the start
+            name = name.lstrip('0123456789.-_ ')
+            
+            # Remove any remaining special characters that Windows doesn't like
+            name = ''.join(c for c in name if c.isalnum() or c in ' -')
+            
+            # Replace multiple spaces with single space
+            name = ' '.join(name.split())
+            
+            # Capitalize words
+            name = ' '.join(word.capitalize() for word in name.split())
+            
+            # Ensure the name isn't too long (Windows has a 255 character limit for filenames)
+            if len(name) > 200:  # Leave room for extensions
+                name = name[:200].rstrip()
+            
+            return name
+        
+        except Exception as e:
+            # If anything goes wrong, return a basic sanitized version
+            return os.path.splitext(os.path.basename(url))[0].replace('_', ' ').replace('-', ' ')
+    
     def process_links(self, links_file: str, temp_dir: str, temp_extract_dir: str,
                      output_dir: str, batch_size: int, progress_queue: Queue,
                      filter_type: str = "All") -> None:
-        """Process links from the links file."""
+        """Process links from the specified file."""
         try:
+            # Load links
             with open(links_file, 'r', encoding='utf-8') as f:
-                links = json.load(f)
+                links_data = json.load(f)
             
-            # Filter links based on filter_type
+            # Filter links based on type
             if filter_type == "Incomplete":
-                links_to_process = [link for link in links if not link.get("copied", False)]
-            else:  # "All"
-                links_to_process = links
+                links_data = [link for link in links_data if not link.get('processed', False)]
+            elif filter_type == "Enabled":
+                links_data = [link for link in links_data if link.get('enabled', True)]
             
-            # Process links in batches
-            for i in range(0, len(links_to_process), batch_size):
-                batch = links_to_process[i:i + batch_size]
+            # Process in batches
+            total_links = len(links_data)
+            for i in range(0, total_links, batch_size):
+                batch = links_data[i:i + batch_size]
                 self._process_batch(batch, temp_dir, temp_extract_dir, output_dir, progress_queue)
                 
                 # Update progress
-                progress = min((i + len(batch)) / len(links_to_process) * 100, 100)
+                progress = min(100, (i + len(batch)) / total_links * 100)
                 progress_queue.put(("progress", progress))
-            
-            progress_queue.put(("status", "Processing complete"))
+                
+                # Update processing log
+                self._update_processing_log(links_file, batch)
         
         except Exception as e:
             progress_queue.put(("status", f"Error processing links: {str(e)}"))
             raise
     
-    def _process_batch(self, batch: List[Dict[str, Any]], temp_dir: str,
-                      temp_extract_dir: str, output_dir: str,
-                      progress_queue: Queue) -> None:
+    def _process_batch(self, batch: List[Dict], temp_dir: str, temp_extract_dir: str,
+                      output_dir: str, progress_queue: Queue) -> None:
         """Process a batch of links."""
         for link in batch:
             try:
-                url = link["url"]
-                progress_queue.put(("status", f"Processing {url}"))
+                url = link.get('url')
+                if not url:
+                    continue
+                
+                # Generate sanitized name if not already present
+                if 'name' not in link:
+                    link['name'] = self._sanitize_game_name(url)
                 
                 # Download file
                 file_path = self._download_file(url, temp_dir, progress_queue)
                 if not file_path:
                     continue
                 
-                # Extract file
-                extract_dir = self._extract_file(file_path, temp_extract_dir, progress_queue)
-                if not extract_dir:
-                    continue
-                
-                # Copy to output
-                if self._copy_to_output(extract_dir, output_dir, progress_queue):
+                # Extract if needed
+                extract_dir = os.path.join(temp_extract_dir, os.path.basename(file_path))
+                if self._extract_file(file_path, extract_dir, progress_queue):
+                    # Copy to output
+                    self._copy_to_output(extract_dir, output_dir, progress_queue)
+                    
                     # Update link status
-                    link["copied"] = True
-                    self._update_processing_log(url, file_path, extract_dir)
+                    link['processed'] = True
+                    link['output_path'] = os.path.join(output_dir, link['name'])
                 
+                # Cleanup
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                if os.path.exists(extract_dir):
+                    shutil.rmtree(extract_dir)
+            
             except Exception as e:
                 progress_queue.put(("status", f"Error processing {url}: {str(e)}"))
+                continue
     
     def _download_file(self, url: str, temp_dir: str,
                       progress_queue: Queue) -> Optional[str]:
@@ -128,8 +181,6 @@ class LinkManager:
                        progress_queue: Queue) -> bool:
         """Copy extracted files to output directory."""
         try:
-            import shutil
-            
             for root, _, files in os.walk(source_dir):
                 for file in files:
                     src_path = os.path.join(root, file)
@@ -238,7 +289,7 @@ class LinkManager:
                     "extracted": False,
                     "deleted": False,
                     "copied": False,
-                    "size_bytes": 0,  # Will be updated when downloaded
+                    "size_bytes": 0,
                     "link_type": link_type
                 }
                 new_links.append(link)
@@ -261,7 +312,7 @@ class LinkManager:
                 progress_queue.put(("status", f"Added {len(new_links)} new {link_type} links to existing {len(existing_links)} links"))
             else:
                 final_links = new_links
-                progress_queue.put(("status", f"Replaced links.json with {len(new_links)} new {link_type} links"))
+                progress_queue.put(("status", f"Created new links.json with {len(new_links)} {link_type} links"))
             
             # Ensure the directory exists
             os.makedirs(os.path.dirname(self.links_file), exist_ok=True)
@@ -275,4 +326,212 @@ class LinkManager:
         
         except Exception as e:
             progress_queue.put(("status", f"Error processing URLs: {str(e)}"))
+            raise
+
+    def update_file_sizes(self, progress_queue: Queue) -> None:
+        """Update missing file sizes in links.json using HEAD requests.
+        
+        Args:
+            progress_queue: Queue for progress updates
+        """
+        try:
+            if not os.path.exists(self.links_file):
+                progress_queue.put(("status", "No links.json found"))
+                return
+            
+            with open(self.links_file, 'r', encoding='utf-8') as f:
+                links = json.load(f)
+            
+            total_links = len(links)
+            missing_links = [link for link in links if not link.get('size_bytes', 0)]
+            total_missing = len(missing_links)
+            
+            if total_missing == 0:
+                progress_queue.put(("status", "No missing sizes found"))
+                return
+            
+            progress_queue.put(("status", f"Found {total_missing} links with missing sizes"))
+            links_updated = 0
+            errors = 0
+            
+            # Create a session for connection pooling
+            with requests.Session() as session:
+                for i, link in enumerate(missing_links):
+                    try:
+                        progress_queue.put(("status", f"Checking size for {os.path.basename(link['url'])}"))
+                        
+                        response = session.head(link['url'], timeout=10, allow_redirects=True)
+                        response.raise_for_status()
+                        
+                        # Get file size from Content-Length header
+                        size = int(response.headers.get('Content-Length', 0))
+                        if size > 0:
+                            # Find and update the link in the original list
+                            for orig_link in links:
+                                if orig_link['url'] == link['url']:
+                                    orig_link['size_bytes'] = size
+                                    break
+                            links_updated += 1
+                            progress_queue.put(("status", 
+                                f"Updated size for {os.path.basename(link['url'])}: {size/1024/1024/1024:.2f} GB"))
+                            
+                            # Save progress after each successful update
+                            try:
+                                with open(self.links_file, 'w', encoding='utf-8') as f:
+                                    json.dump(links, f, indent=4)
+                                progress_queue.put(("status", "Progress saved"))
+                            except Exception as save_error:
+                                progress_queue.put(("status", f"Warning: Could not save progress: {save_error}"))
+                        else:
+                            errors += 1
+                            progress_queue.put(("status", 
+                                f"No size information available for {os.path.basename(link['url'])}"))
+                    
+                    except requests.RequestException as e:
+                        errors += 1
+                        progress_queue.put(("status", 
+                            f"Error checking size for {os.path.basename(link['url'])}: {str(e)}"))
+                    
+                    # Update progress
+                    progress = (i + 1) / total_missing * 100
+                    progress_queue.put(("progress", progress))
+            
+            # Final status update
+            status = f"Size update complete:\n" \
+                    f"- {links_updated} files updated\n" \
+                    f"- {errors} errors\n" \
+                    f"- {total_missing - links_updated - errors} files skipped"
+            progress_queue.put(("status", status))
+            
+        except Exception as e:
+            progress_queue.put(("status", f"Error updating sizes: {str(e)}"))
+            raise
+
+    def merge_links_files(self, second_file: str, progress_queue: Queue) -> None:
+        """Merge another links.json file with the current one.
+        
+        Args:
+            second_file: Path to the second links.json to merge
+            progress_queue: Queue for progress updates
+        """
+        try:
+            if not os.path.exists(self.links_file):
+                progress_queue.put(("status", "Primary links.json not found"))
+                raise FileNotFoundError("Primary links.json not found")
+            
+            if not os.path.exists(second_file):
+                progress_queue.put(("status", "Secondary links.json not found"))
+                raise FileNotFoundError(f"Secondary file not found: {second_file}")
+            
+            # Load both files
+            progress_queue.put(("status", "Loading links files..."))
+            with open(self.links_file, 'r', encoding='utf-8') as f:
+                primary_links = json.load(f)
+            
+            with open(second_file, 'r', encoding='utf-8') as f:
+                secondary_links = json.load(f)
+            
+            # Validate format
+            if not isinstance(primary_links, list) or not isinstance(secondary_links, list):
+                raise ValueError("Invalid links.json format: expected a list")
+            
+            # Create backup of primary file
+            backup_file = f"{self.links_file}.bak"
+            progress_queue.put(("status", f"Creating backup at {backup_file}"))
+            shutil.copy2(self.links_file, backup_file)
+            
+            # Create URL set for quick lookup
+            existing_urls = {link['url'] for link in primary_links}
+            
+            # Merge links, preserving size information
+            new_links = []
+            duplicates = 0
+            updates = 0
+            
+            progress_queue.put(("status", "Merging links..."))
+            total = len(secondary_links)
+            
+            for i, new_link in enumerate(secondary_links):
+                if new_link['url'] in existing_urls:
+                    # If the new link has size info and old one doesn't, update it
+                    for old_link in primary_links:
+                        if old_link['url'] == new_link['url']:
+                            if not old_link.get('size_bytes', 0) and new_link.get('size_bytes', 0):
+                                old_link['size_bytes'] = new_link['size_bytes']
+                                updates += 1
+                            break
+                    duplicates += 1
+                else:
+                    new_links.append(new_link)
+                
+                # Update progress
+                progress = (i + 1) / total * 100
+                progress_queue.put(("progress", progress))
+            
+            # Combine lists
+            merged_links = primary_links + new_links
+            
+            # Save merged file
+            progress_queue.put(("status", "Saving merged links file..."))
+            with open(self.links_file, 'w', encoding='utf-8') as f:
+                json.dump(merged_links, f, indent=4)
+            
+            # Final status
+            status = (
+                f"Merge complete:\n"
+                f"- Added {len(new_links)} new links\n"
+                f"- Found {duplicates} duplicates\n"
+                f"- Updated {updates} existing links with size information\n"
+                f"- Total links: {len(merged_links)}\n"
+                f"- Backup saved as: {os.path.basename(backup_file)}"
+            )
+            progress_queue.put(("status", status))
+            
+        except Exception as e:
+            progress_queue.put(("status", f"Error merging links: {str(e)}"))
+            raise
+
+    def generate_game_names(self, progress_queue: Queue) -> None:
+        """Generate and store sanitized names for all games in links.json."""
+        try:
+            if not os.path.exists(self.links_file):
+                progress_queue.put(("status", "No links.json found"))
+                return
+            
+            # Load links
+            with open(self.links_file, 'r', encoding='utf-8') as f:
+                links_data = json.load(f)
+            
+            total_links = len(links_data)
+            updated = 0
+            
+            # Process each link
+            for i, link in enumerate(links_data):
+                url = link.get('url')
+                if not url:
+                    continue
+                
+                # Generate sanitized name if not already present
+                if 'name' not in link:
+                    link['name'] = self._sanitize_game_name(url)
+                    updated += 1
+                
+                # Update progress
+                progress = (i + 1) / total_links * 100
+                progress_queue.put(("progress", progress))
+                progress_queue.put(("status", f"Processing {i + 1} of {total_links}"))
+            
+            # Save changes if any names were updated
+            if updated > 0:
+                with open(self.links_file, 'w', encoding='utf-8') as f:
+                    json.dump(links_data, f, indent=4)
+                
+                progress_queue.put(("status", f"Generated names for {updated} games"))
+            else:
+                progress_queue.put(("status", "All games already have names"))
+            
+            progress_queue.put(("progress", 100))
+        
+        except Exception as e:
+            progress_queue.put(("status", f"Error generating game names: {str(e)}"))
             raise 

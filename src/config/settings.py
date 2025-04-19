@@ -32,7 +32,11 @@ class AppConfig:
         # Library size tracking
         self.iso_size_gb = 0.0
         self.xbla_size_gb = 0.0
+        self.xbla_addons_size_gb = 0.0
         self.last_size_check = None
+        self.missing_size_iso = 0
+        self.missing_size_xbla = 0
+        self.missing_size_xbla_addons = 0
         
         # Create default config if it doesn't exist
         if not os.path.exists(self.config_file):
@@ -52,7 +56,7 @@ class AppConfig:
             print(f"Error creating default links.json: {e}")
     
     def calculate_library_sizes(self) -> None:
-        """Calculate and store the total size of ISO and XBLA files."""
+        """Calculate and store the total size of ISO, XBLA, and XBLA Addons files."""
         try:
             if not os.path.exists(self.links_file):
                 print("Links file not found. Cannot calculate library sizes.")
@@ -63,23 +67,26 @@ class AppConfig:
             
             iso_size_bytes = 0
             xbla_size_bytes = 0
+            xbla_addons_size_bytes = 0
             total_iso = 0
             total_xbla = 0
-            self.missing_size_iso = 0  # Store as instance variable
-            self.missing_size_xbla = 0  # Store as instance variable
+            total_xbla_addons = 0
+            self.missing_size_iso = 0
+            self.missing_size_xbla = 0
+            self.missing_size_xbla_addons = 0
             
             print(f"\nAnalyzing {len(links_data)} links...")
             
             for link in links_data:
                 # Get size in bytes and link type
                 size_bytes = link.get('size_bytes', 0)
-                link_type = link.get('link_type', 'Unknown')  # Changed from 'type' to 'link_type'
+                link_type = link.get('link_type', 'Unknown')
                 
                 if link_type == 'ISO':
                     total_iso += 1
                     if not size_bytes:
                         self.missing_size_iso += 1
-                        print(f"Found ISO missing size")
+                        print(f"Found ISO missing size: {os.path.basename(link['url'])}")
                     else:
                         iso_size_bytes += size_bytes
                         print(f"Found ISO with size: {size_bytes/1024/1024/1024:.2f} GB")
@@ -87,14 +94,23 @@ class AppConfig:
                     total_xbla += 1
                     if not size_bytes:
                         self.missing_size_xbla += 1
-                        print(f"Found XBLA missing size")
+                        print(f"Found XBLA missing size: {os.path.basename(link['url'])}")
                     else:
                         xbla_size_bytes += size_bytes
                         print(f"Found XBLA with size: {size_bytes/1024/1024/1024:.2f} GB")
+                elif link_type == 'XBLA Addons':
+                    total_xbla_addons += 1
+                    if not size_bytes:
+                        self.missing_size_xbla_addons += 1
+                        print(f"Found XBLA Addon missing size: {os.path.basename(link['url'])}")
+                    else:
+                        xbla_addons_size_bytes += size_bytes
+                        print(f"Found XBLA Addon with size: {size_bytes/1024/1024/1024:.2f} GB")
             
             # Convert to GB (1 GB = 1024^3 bytes)
             self.iso_size_gb = iso_size_bytes / (1024 ** 3)
             self.xbla_size_gb = xbla_size_bytes / (1024 ** 3)
+            self.xbla_addons_size_gb = xbla_addons_size_bytes / (1024 ** 3)
             self.last_size_check = datetime.now().isoformat()
             
             # Save the updated sizes
@@ -103,13 +119,17 @@ class AppConfig:
             print(f"\nLibrary Size Check ({datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}):")
             print(f"ISO Library: {self.iso_size_gb:.2f} GB ({total_iso - self.missing_size_iso}/{total_iso} files with size info)")
             print(f"XBLA Library: {self.xbla_size_gb:.2f} GB ({total_xbla - self.missing_size_xbla}/{total_xbla} files with size info)")
-            print(f"Total: {(self.iso_size_gb + self.xbla_size_gb):.2f} GB")
-            if self.missing_size_iso > 0 or self.missing_size_xbla > 0:
+            print(f"XBLA Addons: {self.xbla_addons_size_gb:.2f} GB ({total_xbla_addons - self.missing_size_xbla_addons}/{total_xbla_addons} files with size info)")
+            print(f"Total: {(self.iso_size_gb + self.xbla_size_gb + self.xbla_addons_size_gb):.2f} GB")
+            
+            if self.missing_size_iso > 0 or self.missing_size_xbla > 0 or self.missing_size_xbla_addons > 0:
                 print("\nMissing Size Information:")
                 if self.missing_size_iso > 0:
                     print(f"- ISO: {self.missing_size_iso} files missing size information")
                 if self.missing_size_xbla > 0:
                     print(f"- XBLA: {self.missing_size_xbla} files missing size information")
+                if self.missing_size_xbla_addons > 0:
+                    print(f"- XBLA Addons: {self.missing_size_xbla_addons} files missing size information")
         
         except Exception as e:
             print(f"Error calculating library sizes: {e}")
@@ -127,19 +147,26 @@ class AppConfig:
             return "Library sizes have not been calculated yet."
         
         last_check = datetime.fromisoformat(self.last_size_check)
+        total_size = self.iso_size_gb + self.xbla_size_gb + self.xbla_addons_size_gb
         info = [
             f"Library Size Information (Last checked: {last_check.strftime('%Y-%m-%d %I:%M:%S %p')})",
+            "",
             f"ISO Library: {self.iso_size_gb:.2f} GB",
             f"XBLA Library: {self.xbla_size_gb:.2f} GB",
-            f"Total: {(self.iso_size_gb + self.xbla_size_gb):.2f} GB",
-            "",  # Empty line for spacing
+            f"XBLA Addons: {self.xbla_addons_size_gb:.2f} GB",
+            f"Total: {total_size:.2f} GB",
+            "",
             "Missing Size Information:",
             f"- ISO: {self.missing_size_iso if hasattr(self, 'missing_size_iso') else 0} files missing size information",
             f"- XBLA: {self.missing_size_xbla if hasattr(self, 'missing_size_xbla') else 0} files missing size information",
-            "",  # Empty line for spacing
+            f"- XBLA Addons: {self.missing_size_xbla_addons if hasattr(self, 'missing_size_xbla_addons') else 0} files missing size information",
+            "",
             "Storage Recommendations:",
-            f"- Total Required: {(self.iso_size_gb + self.xbla_size_gb):.2f} GB",
-            f"- Recommended Free Space: {((self.iso_size_gb + self.xbla_size_gb) * 1.2):.2f} GB (20% buffer)"
+            f"- Total Required: {total_size:.2f} GB",
+            f"- Recommended Free Space: {(total_size * 1.2):.2f} GB (20% buffer)",
+            f"- ISO Library: {self.iso_size_gb:.2f} GB",
+            f"- XBLA Library: {self.xbla_size_gb:.2f} GB",
+            f"- XBLA Addons: {self.xbla_addons_size_gb:.2f} GB"
         ]
         return "\n".join(info)
     
@@ -161,7 +188,11 @@ class AppConfig:
                 "link_type": self.link_type,
                 "iso_size_gb": self.iso_size_gb,
                 "xbla_size_gb": self.xbla_size_gb,
-                "last_size_check": self.last_size_check
+                "xbla_addons_size_gb": self.xbla_addons_size_gb,
+                "last_size_check": self.last_size_check,
+                "missing_size_iso": getattr(self, 'missing_size_iso', 0),
+                "missing_size_xbla": getattr(self, 'missing_size_xbla', 0),
+                "missing_size_xbla_addons": getattr(self, 'missing_size_xbla_addons', 0)
             }
             
             # Ensure config directory exists
@@ -213,10 +244,14 @@ class AppConfig:
                     self.link_type = config.get("link_type", self.link_type)
                     self.iso_size_gb = config.get("iso_size_gb", self.iso_size_gb)
                     self.xbla_size_gb = config.get("xbla_size_gb", self.xbla_size_gb)
+                    self.xbla_addons_size_gb = config.get("xbla_addons_size_gb", self.xbla_addons_size_gb)
                     self.last_size_check = config.get("last_size_check", self.last_size_check)
+                    self.missing_size_iso = config.get("missing_size_iso", 0)
+                    self.missing_size_xbla = config.get("missing_size_xbla", 0)
+                    self.missing_size_xbla_addons = config.get("missing_size_xbla_addons", 0)
             else:
                 print("No config file found, using default values")
-        
+                self.calculate_library_sizes()  # Calculate sizes on first load
         except Exception as e:
             print(f"Error loading config: {e}")
     
@@ -238,7 +273,11 @@ class AppConfig:
                 "link_type": self.link_type,
                 "iso_size_gb": self.iso_size_gb,
                 "xbla_size_gb": self.xbla_size_gb,
-                "last_size_check": self.last_size_check
+                "xbla_addons_size_gb": self.xbla_addons_size_gb,
+                "last_size_check": self.last_size_check,
+                "missing_size_iso": self.missing_size_iso,
+                "missing_size_xbla": self.missing_size_xbla,
+                "missing_size_xbla_addons": self.missing_size_xbla_addons
             }
             
             # Ensure config directory exists
