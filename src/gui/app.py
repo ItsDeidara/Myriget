@@ -10,14 +10,15 @@ from datetime import datetime
 import requests
 import shutil
 import time
+import multiprocessing
 
 from operations.downloader import FileDownloader
 from operations.extractor import FileExtractor
 from operations.copier import FileCopier
+from operations.iso2god import ISO2GODConverter
 from config.settings import AppConfig
 from utils.logger import Logger
 from models.link import LinkManager
-from operations.iso2god import ISO2GODConverter  # Fixed import path
 
 class ExpandableFrame(ttk.Frame):
     """A frame that can be expanded/collapsed with a smooth animation."""
@@ -627,20 +628,37 @@ class DownloaderApp:
             variable=self.convert_god_var
         ).pack(side=tk.LEFT, padx=5)
         
+        # Thread count for GOD conversion
+        thread_frame = ttk.Frame(iso_frame)
+        thread_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Label(thread_frame, text="Threads:").pack(side=tk.LEFT)
+        self.convert_god_threads_var = tk.StringVar(value=str(self.config.iso2god_threads))
+        thread_spinbox = ttk.Spinbox(
+            thread_frame,
+            from_=1,
+            to=15,
+            textvariable=self.convert_god_threads_var,
+            width=5,
+            command=self._save_thread_count
+        )
+        thread_spinbox.pack(side=tk.LEFT, padx=5)
+        
         # Delete ISO after conversion option
-        self.delete_iso_var = tk.BooleanVar(value=False)
+        self.delete_iso_var = tk.BooleanVar(value=self.config.iso2god_delete_iso)
         ttk.Checkbutton(
             iso_frame,
             text="Delete ISO after GOD conversion",
-            variable=self.delete_iso_var
+            variable=self.delete_iso_var,
+            command=lambda: self._save_iso2god_option('iso2god_delete_iso', self.delete_iso_var.get())
         ).pack(side=tk.LEFT, padx=5)
         
         # Trim ISO option
-        self.trim_iso_var = tk.BooleanVar(value=False)
+        self.trim_iso_var = tk.BooleanVar(value=self.config.iso2god_trim)
         ttk.Checkbutton(
             iso_frame,
             text="Trim ISOs",
-            variable=self.trim_iso_var
+            variable=self.trim_iso_var,
+            command=lambda: self._save_iso2god_option('iso2god_trim', self.trim_iso_var.get())
         ).pack(side=tk.LEFT, padx=5)
         
         # File type selection
@@ -679,17 +697,65 @@ class DownloaderApp:
         entry.grid(row=row, column=1, padx=5, pady=5, sticky="ew")
         entry.insert(0, default_value)
         
-        # Store entry reference
+        # Store entry reference and add validation
         if "Download Location" in label_text:
             self.temp_dir_entry = entry
+            entry.bind('<FocusOut>', lambda e: self._validate_and_create_dir(self.temp_dir_entry, 'temp_dir'))
+            entry.bind('<Return>', lambda e: self._validate_and_create_dir(self.temp_dir_entry, 'temp_dir'))
         elif "Extract Location" in label_text:
             self.temp_extract_entry = entry
+            entry.bind('<FocusOut>', lambda e: self._validate_and_create_dir(self.temp_extract_entry, 'temp_extract_dir'))
+            entry.bind('<Return>', lambda e: self._validate_and_create_dir(self.temp_extract_entry, 'temp_extract_dir'))
         elif "Output Location" in label_text:
             self.output_dir_entry = entry
+            entry.bind('<FocusOut>', lambda e: self._validate_and_create_dir(self.output_dir_entry, 'output_dir'))
+            entry.bind('<Return>', lambda e: self._validate_and_create_dir(self.output_dir_entry, 'output_dir'))
             
         ttk.Button(parent, text="Browse", command=browse_command).grid(
             row=row, column=2, padx=5, pady=5)
-    
+
+    def _validate_and_create_dir(self, entry_widget: ttk.Entry, config_attr: str) -> None:
+        """Validate directory path and create if it doesn't exist."""
+        try:
+            directory = entry_widget.get().strip()
+            
+            # Skip if empty
+            if not directory:
+                return
+            
+            # Expand user directory and environment variables
+            directory = os.path.expanduser(directory)
+            directory = os.path.expandvars(directory)
+            
+            # Convert to absolute path
+            directory = os.path.abspath(directory)
+            
+            # Create directory if it doesn't exist
+            if not os.path.exists(directory):
+                try:
+                    os.makedirs(directory)
+                    self._update_status(f"Created directory: {directory}")
+                except Exception as e:
+                    messagebox.showerror(
+                        "Error",
+                        f"Failed to create directory:\n{directory}\n\nError: {str(e)}"
+                    )
+                    return
+            
+            # Update entry with normalized path
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, directory)
+            
+            # Update config
+            setattr(self.config, config_attr, directory)
+            self.config.save()
+            
+        except Exception as e:
+            messagebox.showerror(
+                "Error",
+                f"Invalid directory path:\n{str(e)}"
+            )
+
     def _add_links_control(self, parent: tk.Widget) -> None:
         """Add links file control to the frame."""
         # Create frame for file selection
@@ -876,18 +942,27 @@ class DownloaderApp:
     
     def _browse_temp(self) -> None:
         """Browse for temporary download directory."""
-        self.config.temp_dir = self._browse_directory("Select Temporary Download Directory")
-        self.config.save()
+        directory = self._browse_directory("Select Temporary Download Directory")
+        if directory:
+            self.temp_dir_entry.delete(0, tk.END)
+            self.temp_dir_entry.insert(0, directory)
+            self._validate_and_create_dir(self.temp_dir_entry, 'temp_dir')
     
     def _browse_temp_extract(self) -> None:
         """Browse for temporary extraction directory."""
-        self.config.temp_extract_dir = self._browse_directory("Select Temporary Extraction Directory")
-        self.config.save()
+        directory = self._browse_directory("Select Temporary Extraction Directory")
+        if directory:
+            self.temp_extract_entry.delete(0, tk.END)
+            self.temp_extract_entry.insert(0, directory)
+            self._validate_and_create_dir(self.temp_extract_entry, 'temp_extract_dir')
     
     def _browse_output(self) -> None:
         """Browse for output directory."""
-        self.config.output_dir = self._browse_directory("Select Output Directory")
-        self.config.save()
+        directory = self._browse_directory("Select Output Directory")
+        if directory:
+            self.output_dir_entry.delete(0, tk.END)
+            self.output_dir_entry.insert(0, directory)
+            self._validate_and_create_dir(self.output_dir_entry, 'output_dir')
     
     def _browse_links(self) -> None:
         """Browse for links text file."""
@@ -1099,6 +1174,7 @@ class DownloaderApp:
     def _process_links(self) -> None:
         """Process links in a separate thread."""
         try:
+            self._update_status("Starting processing...")
             self._update_status("Loading links.json...")
             
             # Validate links.json exists
@@ -1113,61 +1189,20 @@ class DownloaderApp:
             
             # Get selected link type
             link_type = self.link_type_var.get()
-            self._update_status(f"Processing {link_type} files...")
-            
-            # Create ISO2GOD converter if needed
             convert_god = self.convert_god_var.get() and link_type == "ISO"
+            
             if convert_god:
-                self.converter = ISO2GODConverter()
-                
-                # Create GOD output directory
-                god_base_dir = os.path.join(self.config.output_dir, "god_converted")
-                os.makedirs(god_base_dir, exist_ok=True)
-                
-                # Check for any downloaded but not converted ISOs
-                for link in links_data:
-                    if (link.get('link_type', '').upper() == 'ISO' and
-                        link.get('downloaded', False) and
-                        link.get('extracted', False) and
-                        not link.get('god_converted', False)):
-                        
-                        game_name = link.get('name', '')
-                        iso_path = os.path.join(self.config.output_dir, game_name + '.iso')
-                        if os.path.exists(iso_path):
-                            self._update_status(f"Found unconverted ISO: {game_name}")
-                            
-                            # Create game-specific output directory in god_converted folder
-                            god_output_dir = os.path.join(god_base_dir, game_name)
-                            os.makedirs(god_output_dir, exist_ok=True)
-                            
-                            # Convert the ISO
-                            self._update_status(f"Converting {game_name} to GOD format...")
-                            success = self.converter.convert_iso(
-                                iso_path=iso_path,
-                                output_dir=god_output_dir,
-                                progress_queue=self.progress_queue,
-                                num_threads=4,  # Default to 4 threads for conversion
-                                trim=self.trim_iso_var.get()
-                            )
-                            
-                            if success:
-                                link['god_converted'] = True
-                                link['god_conversion_date'] = datetime.now().isoformat()
-                                link['god_output_path'] = god_output_dir
-                                
-                                # Delete ISO if requested
-                                if self.delete_iso_var.get():
-                                    try:
-                                        os.remove(iso_path)
-                                        self._update_status(f"Deleted original ISO: {game_name}")
-                                    except Exception as e:
-                                        self._update_status(f"Warning: Could not delete ISO {game_name}: {e}")
-                            else:
-                                link['god_conversion_error'] = "Conversion failed"
-                            
-                            # Save updated status
-                            with open(self.config.links_file, 'w', encoding='utf-8') as f:
-                                json.dump(links_data, f, indent=4)
+                self._update_status(f"Checking output directory for existing ISOs that need conversion...")
+                # The link manager will handle checking and converting existing ISOs
+            else:
+                self._update_status(f"Processing {link_type} files...")
+            
+            # Get batch size and mode from GUI
+            try:
+                batch_size = int(self.batch_entry.get())
+                batch_mode = self.batch_mode_var.get()
+            except ValueError:
+                raise ValueError("Invalid batch size")
             
             # Process the links
             self.link_manager.process_links(
@@ -1175,13 +1210,13 @@ class DownloaderApp:
                 self.config.temp_dir,
                 self.config.temp_extract_dir,
                 self.config.output_dir,
-                self.config.batch_size,
+                batch_size,  # Use the batch size from GUI
                 self.progress_queue,
                 self.filter_type_var.get(),
                 convert_god=convert_god,
                 delete_iso=self.delete_iso_var.get(),
                 trim_iso=self.trim_iso_var.get(),
-                god_output_dir=os.path.join(self.config.output_dir, "god_converted") if convert_god else None
+                batch_mode=batch_mode  # Pass the batch mode from GUI
             )
             
             self._update_status("Processing complete!")
@@ -1334,6 +1369,10 @@ class DownloaderApp:
         # Add refresh button
         ttk.Button(button_frame, text="Refresh List",
                   command=self._load_games).pack(side=tk.LEFT, padx=5)
+        
+        # Add reset library button
+        ttk.Button(button_frame, text="Reset Library Status",
+                  command=self._reset_library_status).pack(side=tk.LEFT, padx=5)
         
         # Search and filter frame
         search_frame = ttk.Frame(container)
@@ -1547,20 +1586,34 @@ class DownloaderApp:
             if search_text:  # Only apply search filter if there's search text
                 matches_name = matches_type = False
                 
+                # Split search text into words for multi-word search
+                search_words = search_text.split()
+                
                 if self.search_name_var.get():
                     if exact_match:
-                        # Split into words and check if search text matches any complete word
+                        # Match all words exactly
                         game_words = set(word.strip('()[]{}.,') for word in game_name.split())
-                        matches_name = search_text in game_words
+                        matches_name = all(search_word in game_words for search_word in search_words)
                     else:
-                        # Partial match anywhere in the name
-                        matches_name = search_text in game_name
+                        # Match all words anywhere in the name
+                        matches_name = all(search_word in game_name for search_word in search_words)
                 
                 if self.search_type_var.get():
                     if exact_match:
-                        matches_type = search_text in game_type.split()
+                        game_type_words = set(game_type.split())
+                        matches_type = all(search_word in game_type_words for search_word in search_words)
                     else:
-                        matches_type = search_text in game_type
+                        matches_type = all(search_word in game_type for search_word in search_words)
+                
+                # Special category matching
+                if any(category in search_text for category in ['sports', 'racing', 'action', 'rpg', 'shooter']):
+                    category_matches = False
+                    game_categories = self._get_game_categories(game_name, game_type)
+                    for search_word in search_words:
+                        if search_word in game_categories:
+                            category_matches = True
+                            break
+                    matches_name = matches_name or category_matches
                 
                 matches_search = (self.search_name_var.get() and matches_name) or \
                                (self.search_type_var.get() and matches_type)
@@ -1582,6 +1635,52 @@ class DownloaderApp:
         
         # Update status count to reflect filtered items
         self._update_status_count()
+
+    def _get_game_categories(self, game_name: str, game_type: str) -> set:
+        """Get categories for a game based on its name and type."""
+        categories = set()
+        
+        # Sports games detection
+        sports_keywords = {'sports', 'fifa', 'nba', 'nfl', 'mlb', 'hockey', 'tennis', 
+                         'golf', 'wrestling', 'boxing', 'ufc', 'racing', 'soccer',
+                         'football', 'baseball', 'basketball'}
+        
+        # Racing games detection
+        racing_keywords = {'racing', 'race', 'cars', 'rally', 'drift', 'forza', 
+                         'motorsport', 'bike', 'rider', 'drive', 'cart', 'speed'}
+        
+        # Action games detection
+        action_keywords = {'action', 'fight', 'combat', 'warrior', 'battle', 'war',
+                         'ninja', 'hero', 'adventure'}
+        
+        # RPG games detection
+        rpg_keywords = {'rpg', 'role', 'fantasy', 'dragon', 'souls', 'elder', 
+                       'scrolls', 'fallout', 'knights'}
+        
+        # Shooter games detection
+        shooter_keywords = {'shooter', 'fps', 'combat', 'warfare', 'call of duty',
+                          'battlefield', 'halo', 'gears', 'sniper'}
+        
+        # Convert game name to a set of words
+        name_words = set(game_name.lower().split())
+        
+        # Check each category
+        if any(keyword in game_name.lower() for keyword in sports_keywords):
+            categories.add('sports')
+        if any(keyword in game_name.lower() for keyword in racing_keywords):
+            categories.add('racing')
+        if any(keyword in game_name.lower() for keyword in action_keywords):
+            categories.add('action')
+        if any(keyword in game_name.lower() for keyword in rpg_keywords):
+            categories.add('rpg')
+        if any(keyword in game_name.lower() for keyword in shooter_keywords):
+            categories.add('shooter')
+            
+        # Add game type as a category
+        if game_type:
+            categories.add(game_type.lower())
+            
+        return categories
 
     def _update_status(self, message: str) -> None:
         """Update the status text with a new message."""
@@ -2213,7 +2312,7 @@ class DownloaderApp:
         main_frame = ttk.Frame(parent, padding="10")
         main_frame.pack(fill="both", expand=True)
         
-        # Header
+        # Header with description
         header_frame = ttk.Frame(main_frame)
         header_frame.pack(fill="x", pady=(0, 10))
         
@@ -2221,7 +2320,14 @@ class DownloaderApp:
             header_frame,
             text="ISO to GOD Conversion",
             font=("Arial", 12, "bold")
-        ).pack(side="left")
+        ).pack(anchor="w")
+        
+        desc_text = ("Convert ISO files to GOD format for Xbox 360.\n"
+                    "• Select source directory containing ISO files\n"
+                    "• Choose output directory for GOD files\n"
+                    "• Configure conversion options\n"
+                    "• Monitor progress in real-time")
+        ttk.Label(header_frame, text=desc_text, wraplength=600).pack(anchor="w", pady=5)
         
         # Settings frame
         settings_frame = ttk.LabelFrame(main_frame, text="Conversion Settings", padding="10")
@@ -2237,7 +2343,7 @@ class DownloaderApp:
         ttk.Button(
             input_frame,
             text="Browse",
-            command=lambda: self._browse_iso_dir()
+            command=self._browse_iso_dir
         ).pack(side="left")
         
         # Output directory
@@ -2250,33 +2356,67 @@ class DownloaderApp:
         ttk.Button(
             output_frame,
             text="Browse",
-            command=lambda: self._browse_god_dir()
+            command=self._browse_god_dir
         ).pack(side="left")
         
         # Conversion options
-        options_frame = ttk.Frame(settings_frame)
-        options_frame.pack(fill="x", pady=(0, 5))
+        options_frame = ttk.LabelFrame(settings_frame, text="Options", padding=5)
+        options_frame.pack(fill="x", pady=(5, 0))
+        
+        # Left side options
+        left_options = ttk.Frame(options_frame)
+        left_options.pack(side="left", padx=10)
         
         # Thread count
-        thread_frame = ttk.Frame(options_frame)
-        thread_frame.pack(side="left", padx=10)
+        thread_frame = ttk.Frame(left_options)
+        thread_frame.pack(fill="x", pady=2)
         ttk.Label(thread_frame, text="Threads:").pack(side="left")
-        self.thread_count_var = tk.StringVar(value="4")
-        ttk.Spinbox(
+        
+        # Get CPU core count for max threads
+        cpu_count = multiprocessing.cpu_count()
+        max_threads = min(15, cpu_count * 2)  # Allow up to 15 threads or 2x CPU cores
+        optimal_threads = max(4, cpu_count - 1)  # Default to CPU cores - 1, minimum 4
+        
+        self.thread_count_var = tk.StringVar(value=str(optimal_threads))
+        thread_spinbox = ttk.Spinbox(
             thread_frame,
             from_=1,
-            to=8,
+            to=max_threads,
             textvariable=self.thread_count_var,
             width=5
-        ).pack(side="left", padx=5)
+        )
+        thread_spinbox.pack(side="left", padx=5)
         
-        # Trim option
+        # Add CPU info tooltip
+        cpu_info = f"CPU Cores: {cpu_count}\nRecommended: {optimal_threads} threads\nMax: {max_threads} threads"
+        ttk.Label(thread_frame, text="ⓘ", cursor="hand2").pack(side="left")
+        CreateToolTip(thread_frame, cpu_info)
+        
+        # Right side options
+        right_options = ttk.Frame(options_frame)
+        right_options.pack(side="left", padx=10)
+        
+        # Checkboxes for options
         self.trim_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            options_frame,
-            text="Trim ISO",
+            right_options,
+            text="Trim ISO (reduce file size)",
             variable=self.trim_var
-        ).pack(side="left", padx=10)
+        ).pack(side="top", anchor="w")
+        
+        self.delete_iso_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            right_options,
+            text="Delete ISO after successful conversion",
+            variable=self.delete_iso_var
+        ).pack(side="top", anchor="w")
+        
+        self.delete_source_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            right_options,
+            text="Delete source folder after conversion",
+            variable=self.delete_source_var
+        ).pack(side="top", anchor="w")
         
         # Control buttons
         control_frame = ttk.Frame(main_frame)
@@ -2285,13 +2425,20 @@ class DownloaderApp:
         ttk.Button(
             control_frame,
             text="Start Conversion",
-            command=self._start_conversion
+            command=self._start_conversion,
+            style="Accent.TButton"
         ).pack(side="left", padx=5)
         
         ttk.Button(
             control_frame,
             text="Stop",
             command=self._stop_conversion
+        ).pack(side="left", padx=5)
+        
+        ttk.Button(
+            control_frame,
+            text="Refresh List",
+            command=self._refresh_iso_list
         ).pack(side="left", padx=5)
         
         # Progress frame
@@ -2316,22 +2463,25 @@ class DownloaderApp:
         list_frame.pack(fill="both", expand=True, pady=(5, 0))
         
         # Create treeview
-        columns = ("game", "status", "size")
+        columns = ("game", "status", "size", "path")
         self.conversion_tree = ttk.Treeview(
             list_frame,
             columns=columns,
-            show="headings"
+            show="headings",
+            selectmode="extended"
         )
         
         # Define headings
-        self.conversion_tree.heading("game", text="Game")
-        self.conversion_tree.heading("status", text="Status")
-        self.conversion_tree.heading("size", text="Size")
+        self.conversion_tree.heading("game", text="Game", command=lambda: self._sort_conversion_list("game"))
+        self.conversion_tree.heading("status", text="Status", command=lambda: self._sort_conversion_list("status"))
+        self.conversion_tree.heading("size", text="Size", command=lambda: self._sort_conversion_list("size"))
+        self.conversion_tree.heading("path", text="Path", command=lambda: self._sort_conversion_list("path"))
         
         # Define columns
         self.conversion_tree.column("game", width=300)
         self.conversion_tree.column("status", width=100)
         self.conversion_tree.column("size", width=100)
+        self.conversion_tree.column("path", width=400)
         
         # Add scrollbar
         scrollbar = ttk.Scrollbar(
@@ -2344,24 +2494,163 @@ class DownloaderApp:
         # Pack tree and scrollbar
         self.conversion_tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        
+        # Bind right-click menu
+        self.conversion_tree.bind("<Button-3>", self._show_conversion_menu)
+        
+        # Create right-click menu
+        self.conversion_menu = tk.Menu(self.root, tearoff=0)
+        self.conversion_menu.add_command(label="Convert Selected", command=self._convert_selected)
+        self.conversion_menu.add_command(label="Delete Selected", command=self._delete_selected_isos)
+        self.conversion_menu.add_separator()
+        self.conversion_menu.add_command(label="Open ISO Location", command=self._open_iso_location)
+        self.conversion_menu.add_command(label="Open GOD Location", command=self._open_god_location)
+        
+        # Initial refresh of the list
+        self._refresh_iso_list()
 
-    def _browse_iso_dir(self):
-        """Browse for ISO directory."""
-        directory = filedialog.askdirectory(title="Select ISO Directory")
-        if directory:
-            self.iso_dir_var.set(directory)
-            setattr(self.config, 'iso_dir', directory)
-            self.config.save()
+    def _refresh_iso_list(self):
+        """Refresh the ISO list in the conversion tab."""
+        # Clear existing items
+        for item in self.conversion_tree.get_children():
+            self.conversion_tree.delete(item)
+        
+        # Get ISO directory
+        iso_dir = self.iso_dir_var.get()
+        if not iso_dir or not os.path.exists(iso_dir):
+            return
+        
+        # Find all ISO files
+        for root, _, files in os.walk(iso_dir):
+            for file in files:
+                if file.lower().endswith('.iso'):
+                    file_path = os.path.join(root, file)
+                    size = os.path.getsize(file_path)
+                    size_str = f"{size / (1024*1024*1024):.2f} GB"
+                    
+                    # Check if GOD version exists
+                    god_dir = self.god_dir_var.get()
+                    game_name = os.path.splitext(file)[0]
+                    god_path = os.path.join(god_dir, game_name) if god_dir else None
+                    
+                    status = "Not Converted"
+                    if god_path and os.path.exists(god_path):
+                        god_files = [f for f in os.listdir(god_path) if f.endswith('.god')]
+                        if god_files:
+                            status = "Converted"
+                    
+                    self.conversion_tree.insert('', 'end', values=(
+                        game_name,
+                        status,
+                        size_str,
+                        file_path
+                    ))
 
-    def _browse_god_dir(self):
-        """Browse for GOD output directory."""
-        directory = filedialog.askdirectory(title="Select GOD Output Directory")
-        if directory:
-            self.god_dir_var.set(directory)
-            setattr(self.config, 'god_dir', directory)
-            self.config.save()
+    def _sort_conversion_list(self, column):
+        """Sort the conversion list by column."""
+        # Get all items
+        items = [(self.conversion_tree.set(item, column), item) for item in self.conversion_tree.get_children()]
+        
+        # Sort items
+        items.sort(reverse=hasattr(self, 'sort_reverse') and self.sort_reverse)
+        
+        # Move items in sorted order
+        for index, (_, item) in enumerate(items):
+            self.conversion_tree.move(item, '', index)
+        
+        # Toggle sort direction
+        self.sort_reverse = not getattr(self, 'sort_reverse', False)
 
-    def _start_conversion(self):
+    def _show_conversion_menu(self, event):
+        """Show the right-click menu for the conversion tree."""
+        # Get item under cursor
+        item = self.conversion_tree.identify_row(event.y)
+        if item:
+            # Select the item if not already selected
+            if item not in self.conversion_tree.selection():
+                self.conversion_tree.selection_set(item)
+            # Show menu
+            self.conversion_menu.post(event.x_root, event.y_root)
+
+    def _convert_selected(self):
+        """Convert selected ISOs to GOD format."""
+        selected = self.conversion_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select ISOs to convert")
+            return
+        
+        # Get paths of selected items
+        iso_paths = []
+        for item in selected:
+            values = self.conversion_tree.item(item)['values']
+            if values[1] != "Converted":  # Only add if not already converted
+                iso_paths.append(values[3])  # Path is in the fourth column
+        
+        if not iso_paths:
+            messagebox.showinfo("Info", "All selected items are already converted")
+            return
+        
+        # Start conversion
+        self._start_conversion(iso_paths)
+
+    def _delete_selected_isos(self):
+        """Delete selected ISO files."""
+        selected = self.conversion_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select ISOs to delete")
+            return
+        
+        # Confirm deletion
+        if not messagebox.askyesno("Confirm Delete",
+                                 "Are you sure you want to delete the selected ISO files?\n"
+                                 "This action cannot be undone."):
+            return
+        
+        # Delete files
+        deleted = 0
+        errors = 0
+        for item in selected:
+            values = self.conversion_tree.item(item)['values']
+            file_path = values[3]  # Path is in the fourth column
+            try:
+                os.remove(file_path)
+                self.conversion_tree.delete(item)
+                deleted += 1
+            except Exception as e:
+                errors += 1
+                self._update_status(f"Error deleting {values[0]}: {str(e)}")
+        
+        # Show results
+        self._update_status(f"Deleted {deleted} files, {errors} errors")
+        if deleted > 0:
+            self._refresh_iso_list()
+
+    def _open_iso_location(self):
+        """Open the location of the selected ISO file."""
+        selected = self.conversion_tree.selection()
+        if not selected:
+            return
+        
+        values = self.conversion_tree.item(selected[0])['values']
+        file_path = values[3]  # Path is in the fourth column
+        os.startfile(os.path.dirname(file_path))
+
+    def _open_god_location(self):
+        """Open the GOD output location for the selected game."""
+        selected = self.conversion_tree.selection()
+        if not selected:
+            return
+        
+        values = self.conversion_tree.item(selected[0])['values']
+        game_name = values[0]  # Game name is in the first column
+        god_path = os.path.join(self.god_dir_var.get(), game_name)
+        
+        if os.path.exists(god_path):
+            os.startfile(god_path)
+        else:
+            messagebox.showinfo("Info", "GOD version not found for this game")
+
+    def _start_conversion(self, specific_files=None):
         """Start the ISO to GOD conversion process."""
         if self.processing:
             messagebox.showwarning(
@@ -2384,13 +2673,23 @@ class DownloaderApp:
         # Get conversion settings
         try:
             num_threads = int(self.thread_count_var.get())
-            if num_threads < 1 or num_threads > 8:
-                raise ValueError("Thread count must be between 1 and 8")
+            if num_threads < 1 or num_threads > 15:  # Allow up to 15 threads
+                raise ValueError("Thread count must be between 1 and 15")
         except ValueError as e:
             messagebox.showerror("Error", str(e))
             return
-        
-        trim = self.trim_var.get()
+
+        # Warn user about conversion duration
+        if not messagebox.askyesno(
+            "Conversion Time Warning",
+            "Converting ISOs to GOD format is a very time-intensive process:\n\n"
+            "• Each game can take 10+ minutes to convert\n"
+            "• Larger games (8GB+) may take even longer\n"
+            "• Using more threads can help but also uses more CPU\n"
+            "• Your computer may run slower during conversion\n\n"
+            "Are you sure you want to proceed with the conversion?"
+        ):
+            return
         
         # Create directories if they don't exist
         try:
@@ -2402,10 +2701,13 @@ class DownloaderApp:
         
         # Start conversion in a separate thread
         self.processing = True
-        self.progress_queue.put(("progress", 0))
+        self.conversion_status.config(text="Starting conversion...")
+        self.conversion_progress['value'] = 0
+        
+        # Start the conversion thread
         threading.Thread(
             target=self._run_conversion,
-            args=(iso_dir, god_dir, num_threads, trim),
+            args=(iso_dir, god_dir, num_threads, self.trim_var.get(), specific_files),
             daemon=True
         ).start()
 
@@ -2416,70 +2718,78 @@ class DownloaderApp:
             self._update_status("Conversion stopped")
             self.processing = False
 
-    def _run_conversion(self, iso_dir: str, god_dir: str, num_threads: int, trim: bool):
+    def _run_conversion(self, iso_dir: str, god_dir: str, num_threads: int, trim: bool, specific_files=None):
         """Run the conversion process in a separate thread."""
         try:
             # Create converter instance
-            self.converter = ISO2GODConverter()
+            try:
+                self.converter = ISO2GODConverter()
+            except Exception as e:
+                raise Exception(f"Failed to initialize ISO2GOD converter: {str(e)}")
             
-            # Update status
-            self._update_status("Starting conversion process...")
+            # Save directories to config
+            self.config.iso_dir = iso_dir
+            self.config.god_dir = god_dir
+            self.config.save()
             
             # Get list of ISO files
-            iso_files = [f for f in os.listdir(iso_dir) if f.lower().endswith('.iso')]
+            if specific_files:
+                iso_files = [(os.path.basename(f), f) for f in specific_files]
+            else:
+                iso_files = [(f, os.path.join(iso_dir, f)) 
+                            for f in os.listdir(iso_dir) 
+                            if f.lower().endswith('.iso')]
+            
             if not iso_files:
-                self._update_status("No ISO files found in directory")
+                self._update_status("No ISO files found to convert")
                 messagebox.showinfo("Complete", "No ISO files found to convert")
                 return
             
-            # Clear existing items in tree
-            for item in self.conversion_tree.get_children():
-                self.conversion_tree.delete(item)
-            
-            # Add files to tree
-            for iso_file in iso_files:
-                self.conversion_tree.insert('', 'end', values=(
-                    iso_file,
-                    "Pending",
-                    f"{os.path.getsize(os.path.join(iso_dir, iso_file)) / (1024*1024*1024):.2f} GB"
-                ))
-            
             # Process each ISO file
             total_files = len(iso_files)
-            for i, iso_file in enumerate(iso_files, 1):
+            for i, (iso_name, iso_path) in enumerate(iso_files, 1):
                 if not self.processing:  # Check if we should stop
                     break
                 
-                iso_path = os.path.join(iso_dir, iso_file)
-                game_output_dir = os.path.join(god_dir, os.path.splitext(iso_file)[0])
+                game_name = os.path.splitext(iso_name)[0]
+                game_output_dir = os.path.join(god_dir, game_name)
+                os.makedirs(game_output_dir, exist_ok=True)
                 
                 # Update tree status
                 for item in self.conversion_tree.get_children():
-                    if self.conversion_tree.item(item)['values'][0] == iso_file:
+                    if self.conversion_tree.item(item)['values'][0] == game_name:
                         self.conversion_tree.item(item, values=(
-                            iso_file,
+                            game_name,
                             "Converting...",
-                            self.conversion_tree.item(item)['values'][2]
+                            self.conversion_tree.item(item)['values'][2],
+                            iso_path
                         ))
                         break
                 
                 # Convert the ISO
-                success = self.converter.convert_iso(
-                    iso_path=iso_path,
-                    output_dir=game_output_dir,
-                    progress_queue=self.progress_queue,
-                    num_threads=num_threads,
-                    trim=trim
-                )
+                self._update_status(f"Converting {iso_name} ({i}/{total_files})")
+                try:
+                    success = self.converter.convert_iso_to_god(
+                        iso_path=iso_path,
+                        output_dir=game_output_dir,
+                        progress_queue=self.progress_queue,
+                        num_threads=num_threads,
+                        trim=trim
+                    )
+                except AttributeError as e:
+                    raise Exception(f"ISO2GOD converter method not found: {str(e)}")
+                except Exception as e:
+                    raise Exception(f"Error during conversion: {str(e)}")
                 
                 # Update status in tree
                 status = "Complete" if success else "Failed"
                 for item in self.conversion_tree.get_children():
-                    if self.conversion_tree.item(item)['values'][0] == iso_file:
+                    if self.conversion_tree.item(item)['values'][0] == game_name:
                         self.conversion_tree.item(item, values=(
-                            iso_file,
+                            game_name,
                             status,
-                            self.conversion_tree.item(item)['values'][2]
+                            self.conversion_tree.item(item)['values'][2],
+                            iso_path
                         ))
                         break
                 
@@ -2493,9 +2803,176 @@ class DownloaderApp:
                 messagebox.showinfo("Complete", "All ISO files have been converted")
             
         except Exception as e:
-            self._update_status(f"Error during conversion: {str(e)}")
-            messagebox.showerror("Error", f"Conversion failed: {str(e)}")
+            error_msg = f"Conversion failed: {str(e)}"
+            self._update_status(error_msg)
+            messagebox.showerror("Error", error_msg)
         finally:
             self.processing = False
             self.conversion_progress['value'] = 0
             self.conversion_status.config(text="Ready")
+
+    def _reset_library_status(self) -> None:
+        """Reset all processing statuses in links.json to their initial state."""
+        if not os.path.exists(self.config.links_file):
+            messagebox.showerror("Error", "No links.json file found")
+            return
+            
+        # Confirm with user
+        if not messagebox.askyesno(
+            "Confirm Reset",
+            "This will reset ALL processing status in your library to their initial state:\n\n"
+            "• Download status\n"
+            "• Extraction status\n"
+            "• Copy status\n"
+            "• GOD conversion status\n"
+            "• Import status\n\n"
+            "This is useful for:\n"
+            "• Starting fresh with a clean library\n"
+            "• Creating a clean links.json to share\n"
+            "• Troubleshooting processing issues\n\n"
+            "A backup of your current links.json will be created.\n"
+            "Would you like to proceed?"
+        ):
+            return
+            
+        try:
+            # Create backup
+            backup_file = f"{self.config.links_file}.bak"
+            shutil.copy2(self.config.links_file, backup_file)
+            
+            # Load current links.json
+            with open(self.config.links_file, 'r', encoding='utf-8') as f:
+                links_data = json.load(f)
+            
+            # Reset status for each link
+            for link in links_data:
+                # Reset common fields
+                link['processed'] = False
+                link['downloaded'] = False
+                link['extracted'] = False
+                link['deleted'] = False
+                link['copied'] = False
+                link['imported'] = False
+                link['import_date'] = None
+                link['output_path'] = None
+                
+                # Reset ISO-specific fields if it's an ISO
+                if link.get('link_type', '').upper() == 'ISO':
+                    link['god_converted'] = False
+                    link['god_conversion_date'] = None
+                    link['god_output_path'] = None
+                    link['god_conversion_error'] = None
+                    link['god_conversion_progress'] = 0
+                    link['god_conversion_started'] = False
+                    link['god_conversion_completed'] = False
+                
+                # Keep enabled status and other metadata
+                # This preserves user preferences while resetting processing status
+            
+            # Save updated links.json
+            with open(self.config.links_file, 'w', encoding='utf-8') as f:
+                json.dump(links_data, f, indent=4)
+            
+            self._update_status("Library status has been reset successfully")
+            
+            # Reload the games list to show updated status
+            self._load_games()
+            
+            messagebox.showinfo(
+                "Reset Complete",
+                f"Library status has been reset successfully.\n\n"
+                f"A backup of your previous links.json has been saved as:\n{backup_file}"
+            )
+            
+        except Exception as e:
+            self.logger.log(f"Error resetting library status: {e}")
+            messagebox.showerror(
+                "Error",
+                f"Failed to reset library status: {str(e)}\n\n"
+                "Your original links.json has not been modified."
+            )
+
+    def _browse_iso_dir(self):
+        """Browse for ISO directory."""
+        directory = filedialog.askdirectory(title="Select ISO Directory")
+        if directory:
+            self.iso_dir_var.set(directory)
+            setattr(self.config, 'iso_dir', directory)
+            self.config.save()
+
+    def _browse_god_dir(self):
+        """Browse for GOD output directory."""
+        directory = filedialog.askdirectory(title="Select GOD Output Directory")
+        if directory:
+            self.god_dir_var.set(directory)
+            setattr(self.config, 'god_dir', directory)
+            self.config.save()
+
+    def _save_thread_count(self) -> None:
+        """Save the thread count value to config."""
+        try:
+            thread_count = int(self.convert_god_threads_var.get())
+            if 1 <= thread_count <= 8:  # Validate thread count range (1-8)
+                self.config.iso2god_threads = thread_count
+                self.config.save()
+                self._update_status(f"Thread count updated to {thread_count}")
+            else:
+                self._update_status("Error: Thread count must be between 1 and 8")
+                # Reset to last valid value
+                self.convert_god_threads_var.set(str(self.config.iso2god_threads))
+        except ValueError:
+            self._update_status("Error: Invalid thread count value")
+            # Reset to last valid value
+            self.convert_god_threads_var.set(str(self.config.iso2god_threads))
+
+class CreateToolTip(object):
+    """Create a tooltip for a given widget."""
+    def __init__(self, widget, text='widget info'):
+        self.waittime = 500     # miliseconds
+        self.wraplength = 180   # pixels
+        self.widget = widget
+        self.text = text
+        self.widget.bind('<Enter>', self.enter)
+        self.widget.bind('<Leave>', self.leave)
+        self.widget.bind('<Button-1>', self.enter)
+        self.id = None
+        self.tw = None
+
+    def enter(self, event=None):
+        self.schedule()
+
+    def leave(self, event=None):
+        self.unschedule()
+        self.hidetip()
+
+    def schedule(self):
+        self.unschedule()
+        self.id = self.widget.after(self.waittime, self.showtip)
+
+    def unschedule(self):
+        id = self.id
+        self.id = None
+        if id:
+            self.widget.after_cancel(id)
+
+    def showtip(self, event=None):
+        x = y = 0
+        x, y, cx, cy = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 20
+        
+        # creates a toplevel window
+        self.tw = tk.Toplevel(self.widget)
+        # Leaves only the label and removes the app window
+        self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(self.tw, text=self.text, justify='left',
+                      background="#ffffff", relief='solid', borderwidth=1,
+                      wraplength = self.wraplength)
+        label.pack(ipadx=1)
+
+    def hidetip(self):
+        tw = self.tw
+        self.tw= None
+        if tw:
+            tw.destroy()

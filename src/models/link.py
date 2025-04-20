@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 from queue import Queue
 import shutil
 import time
+import urllib.parse
 
 class LinkManager:
     """Manages link processing and JSON operations."""
@@ -37,10 +38,7 @@ class LinkManager:
             # Replace special characters with spaces
             name = name.replace('_', ' ').replace('-', ' ').replace('+', ' ')
             
-            # Remove any numbers or special characters at the start
-            name = name.lstrip('0123456789.-_ ')
-            
-            # Remove any remaining special characters that Windows doesn't like
+            # Remove any special characters that Windows doesn't like
             name = ''.join(c for c in name if c.isalnum() or c in ' -')
             
             # Replace multiple spaces with single space
@@ -86,27 +84,105 @@ class LinkManager:
     
     def process_links(self, links_file: str, temp_dir: str, temp_extract_dir: str,
                      output_dir: str, batch_size: int, progress_queue: Queue,
-                     filter_type: str = "All") -> None:
-        """Process links from the specified file."""
+                     filter_type: str = "All", convert_god: bool = False,
+                     delete_iso: bool = False, trim_iso: bool = True,
+                     batch_mode: str = "By Number") -> None:
+        """Process links from the specified file.
+        
+        Args:
+            links_file: Path to the links JSON file
+            temp_dir: Directory for temporary downloads
+            temp_extract_dir: Directory for temporary extraction
+            output_dir: Directory for final output
+            batch_size: Number of links to process in each batch (or size in MB if using size-based batching)
+            progress_queue: Queue for progress updates
+            filter_type: Type of filtering to apply ("All", "Incomplete", "Enabled")
+            convert_god: Whether to convert ISO files to GOD format
+            delete_iso: Whether to delete ISO files after successful GOD conversion
+            trim_iso: Whether to trim unused space from ISO files during conversion
+            batch_mode: Either "By Number" or "By Size (MB)"
+        """
         try:
             # Important messages - show immediately
             progress_queue.put(("status", "Loading links from file..."))
             with open(links_file, 'r', encoding='utf-8') as f:
                 links_data = json.load(f)
-            
-            # Validate URLs in JSON
-            invalid_urls = []
-            for link in links_data:
-                url = link.get('url', '')
-                if not url.endswith('.zip'):
-                    invalid_urls.append(url)
-            
-            if invalid_urls:
-                error_msg = "Error: Found invalid URLs in links.json (will be skipped):\n" + "\n".join(invalid_urls)
-                progress_queue.put(("status", error_msg))
-                # Don't raise error, just skip invalid URLs
-                links_data = [link for link in links_data if link.get('url', '').endswith('.zip')]
-            
+
+            # If GOD conversion is enabled, check for existing ISOs first
+            if convert_god:
+                progress_queue.put(("status", "Checking for existing ISOs that need GOD conversion..."))
+                isos_to_convert = []
+                for link in links_data:
+                    if link.get('link_type', '').upper() == 'ISO':
+                        game_name = link.get('name', '')
+                        if not game_name:
+                            continue
+
+                        # Check both with and without spaces in filename
+                        potential_paths = [
+                            os.path.join(output_dir, f"{game_name}.iso"),
+                            os.path.join(output_dir, f"{game_name.replace(' ', '_')}.iso"),
+                            os.path.join(output_dir, f"{game_name.replace(' ', '')}.iso")
+                        ]
+
+                        for iso_path in potential_paths:
+                            if os.path.exists(iso_path):
+                                progress_queue.put(("status", f"Found existing ISO: {os.path.basename(iso_path)}"))
+                                god_output_dir = os.path.join(output_dir, 'god_converted', game_name)
+                                
+                                # Check if it needs conversion
+                                if (not link.get('god_converted', False) or 
+                                    not link.get('god_conversion_completed', False) or 
+                                    link.get('god_conversion_error')):
+                                    
+                                    isos_to_convert.append((iso_path, god_output_dir, game_name))
+                                    progress_queue.put(("status", f"Marked for GOD conversion: {game_name}"))
+                                break
+
+                # Convert any found ISOs before proceeding with downloads
+                if isos_to_convert:
+                    progress_queue.put(("status", f"Found {len(isos_to_convert)} existing ISOs to convert"))
+                    from operations.iso2god import ISO2GODConverter
+                    converter = ISO2GODConverter()
+
+                    for iso_path, god_output_dir, game_name in isos_to_convert:
+                        progress_queue.put(("status", f"Converting {os.path.basename(iso_path)} to GOD format..."))
+                        os.makedirs(god_output_dir, exist_ok=True)
+
+                        success = converter.convert_iso_to_god(
+                            iso_path=iso_path,
+                            output_dir=god_output_dir,
+                            progress_queue=progress_queue,
+                            trim=trim_iso
+                        )
+
+                        # Update link status
+                        for link in links_data:
+                            if link.get('name') == game_name:
+                                if success:
+                                    link['god_converted'] = True
+                                    link['god_conversion_completed'] = True
+                                    link['god_conversion_date'] = datetime.now().isoformat()
+                                    link['god_output_path'] = god_output_dir
+                                    link['god_conversion_error'] = None
+                                    
+                                    # Delete ISO if requested
+                                    if delete_iso:
+                                        try:
+                                            os.remove(iso_path)
+                                            progress_queue.put(("status", f"Deleted original ISO after successful conversion: {os.path.basename(iso_path)}"))
+                                        except Exception as e:
+                                            progress_queue.put(("status", f"Warning: Could not delete ISO {os.path.basename(iso_path)}: {e}"))
+                                else:
+                                    link['god_conversion_error'] = "Conversion failed"
+                                    link['god_conversion_started'] = False
+                                    link['god_conversion_completed'] = False
+                                break
+
+                        # Save updated status
+                        with open(links_file, 'w', encoding='utf-8') as f:
+                            json.dump(links_data, f, indent=4)
+
             # Filter links based on type
             total_before_filter = len(links_data)
             if filter_type == "Incomplete":
@@ -115,21 +191,11 @@ class LinkManager:
                     link.get('extracted', False) and 
                     link.get('copied', False)
                 )]
-                progress_queue.put(("status", "\033[38;5;208mBefore filtering: {total_before_filter} links\033[0m".format(total_before_filter=total_before_filter)))
-                progress_queue.put(("status", "\033[38;5;208mAfter filtering for incomplete: {filtered} links\033[0m".format(filtered=len(links_data))))
-                
-                # Debug counts for each state
-                downloaded_count = sum(1 for link in links_data if link.get('downloaded', False))
-                extracted_count = sum(1 for link in links_data if link.get('extracted', False))
-                copied_count = sum(1 for link in links_data if link.get('copied', False))
-                progress_queue.put(("status", "\033[38;5;208mState counts in filtered links:\033[0m"))
-                progress_queue.put(("status", "\033[38;5;208m- Downloaded: {downloaded_count}\033[0m".format(downloaded_count=downloaded_count)))
-                progress_queue.put(("status", "\033[38;5;208m- Extracted: {extracted_count}\033[0m".format(extracted_count=extracted_count)))
-                progress_queue.put(("status", "\033[38;5;208m- Copied: {copied_count}\033[0m".format(copied_count=copied_count)))
-                
+                progress_queue.put(("status", f"Before filtering: {total_before_filter} links"))
+                progress_queue.put(("status", f"After filtering for incomplete: {len(links_data)} links"))
             elif filter_type == "Enabled":
                 links_data = [link for link in links_data if link.get('enabled', True)]
-                progress_queue.put(("status", "\033[38;5;208mAfter filtering for enabled: {filtered} links\033[0m".format(filtered=len(links_data))))
+                progress_queue.put(("status", f"After filtering for enabled: {len(links_data)} links"))
             
             # Count total links to process
             total_links = len(links_data)
@@ -141,82 +207,79 @@ class LinkManager:
             
             # Process in batches
             processed_count = 0
-            total_batches = (total_links + batch_size - 1) // batch_size  # Calculate total number of batches
-            for i in range(0, total_links, batch_size):
-                batch = links_data[i:i + batch_size]
-                batch_size_actual = len(batch)
-                current_batch = (i // batch_size) + 1
-                status_msg = f"\033[38;5;208mProcessing batch {current_batch} of {total_batches} ({batch_size_actual} links)...\033[0m"
-                progress_queue.put(("status", status_msg))
+            current_batch = 1
+            
+            if batch_mode == "By Size (MB)":
+                # Calculate total batches based on total size
+                total_size_mb = sum(link.get('size_bytes', 0) / (1024 * 1024) for link in links_data)
+                total_batches = max(1, int((total_size_mb + batch_size - 1) // batch_size))
                 
-                # Process each link in the batch
-                for j, link in enumerate(batch):
-                    try:
-                        # Skip disabled games
-                        if not link.get('enabled', True):
-                            status_msg = f"Skipping disabled game: {link.get('name', 'Unknown')}"
-                            if self._should_update_status(status_msg):
-                                progress_queue.put(("status", status_msg))
-                            continue
-                        
-                        # Get game name
-                        game_name = link.get('name', os.path.basename(link['url']))
-                        status_msg = f"Processing {game_name} ({processed_count + 1}/{total_links})"
-                        if self._should_update_status(status_msg):
-                            progress_queue.put(("status", status_msg))
-                        
-                        # Download file
-                        file_path = self._download_file(link['url'], temp_dir, progress_queue)
-                        if not file_path:
-                            continue
-                        
-                        # Extract if needed
-                        extract_dir = os.path.join(temp_extract_dir, os.path.basename(file_path))
-                        if self._extract_file(file_path, extract_dir, progress_queue):
-                            # Copy to output
-                            if self._copy_to_output(extract_dir, output_dir, progress_queue):
-                                # Update link status
-                                link['downloaded'] = True
-                                link['extracted'] = True
-                                link['copied'] = True
-                                link['processed'] = True
-                                link['output_path'] = os.path.join(output_dir, game_name)
-                                
-                                # Save progress after each successful game
-                                with open(links_file, 'w', encoding='utf-8') as f:
-                                    json.dump(links_data, f, indent=4)
-                                
-                                # Show success immediately
-                                progress_queue.put(("status", f"Successfully processed: {game_name}"))
-                        
-                        # Cleanup
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                            status_msg = f"Cleaned up download: {game_name}"
-                            if self._should_update_status(status_msg):
-                                progress_queue.put(("status", status_msg))
-                        if os.path.exists(extract_dir):
-                            shutil.rmtree(extract_dir)
-                            status_msg = f"Cleaned up extraction: {game_name}"
-                            if self._should_update_status(status_msg):
-                                progress_queue.put(("status", status_msg))
-                        
-                        processed_count += 1
-                        # Update progress
-                        progress = (processed_count / total_links) * 100
-                        progress_queue.put(("progress", progress))
-                        
-                    except Exception as e:
-                        # Show errors immediately
-                        error_msg = f"Error processing {link.get('name', 'Unknown')}: {str(e)}"
-                        progress_queue.put(("status", error_msg))
-                        continue
+                # Process by size
+                current_batch_links = []
+                current_batch_size_mb = 0
                 
-                # Save progress after each batch
-                status_msg = f"\033[38;5;208mCompleted batch {current_batch} of {total_batches}. Progress: {(processed_count / total_links) * 100:.1f}%\033[0m"
-                progress_queue.put(("status", status_msg))
-                with open(links_file, 'w', encoding='utf-8') as f:
-                    json.dump(links_data, f, indent=4)
+                # Sort links by size (largest first) to optimize batch filling
+                links_with_size = [(link, link.get('size_bytes', 0) / (1024 * 1024)) for link in links_data]
+                remaining_links = sorted(links_with_size, key=lambda x: x[1], reverse=True)
+                
+                while remaining_links:
+                    # Try to find the best fit for remaining space in current batch
+                    best_fit = None
+                    best_fit_size = 0
+                    best_fit_index = -1
+                    
+                    # Look through remaining links to find best fit
+                    for i, (link, size_mb) in enumerate(remaining_links):
+                        # If this link fits and is better than current best fit
+                        if current_batch_size_mb + size_mb <= batch_size:
+                            if size_mb > best_fit_size:
+                                best_fit = link
+                                best_fit_size = size_mb
+                                best_fit_index = i
+                    
+                    # If we found a fit, add it to current batch
+                    if best_fit is not None:
+                        current_batch_links.append(best_fit)
+                        current_batch_size_mb += best_fit_size
+                        remaining_links.pop(best_fit_index)
+                        
+                        # If we're close enough to batch size or this is last item, process batch
+                        if (current_batch_size_mb >= batch_size * 0.9 or  # 90% full
+                            not remaining_links or  # no more links
+                            current_batch_size_mb + min(size for _, size in remaining_links) > batch_size):  # can't fit smallest remaining
+                            
+                            progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(current_batch_links)} links, {current_batch_size_mb:.2f} MB)"))
+                            self._process_batch(current_batch_links, temp_dir, temp_extract_dir, output_dir,
+                                             progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso)
+                            processed_count += len(current_batch_links)
+                            
+                            # Reset for next batch
+                            current_batch_links = []
+                            current_batch_size_mb = 0
+                            current_batch += 1
+                    else:
+                        # If no links fit in remaining space, force start new batch with largest remaining
+                        if current_batch_links:  # Process current batch if it exists
+                            progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(current_batch_links)} links, {current_batch_size_mb:.2f} MB)"))
+                            self._process_batch(current_batch_links, temp_dir, temp_extract_dir, output_dir,
+                                             progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso)
+                            processed_count += len(current_batch_links)
+                            current_batch += 1
+                        
+                        # Start new batch with largest remaining link
+                        link, size_mb = remaining_links.pop(0)
+                        current_batch_links = [link]
+                        current_batch_size_mb = size_mb
+            else:
+                # Process by number
+                total_batches = (total_links + batch_size - 1) // batch_size
+                for i in range(0, total_links, batch_size):
+                    batch = links_data[i:i + batch_size]
+                    progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(batch)} links)"))
+                    self._process_batch(batch, temp_dir, temp_extract_dir, output_dir,
+                                     progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso)
+                    processed_count += len(batch)
+                    current_batch += 1
             
             # Show completion immediately
             progress_queue.put(("status", f"Processing complete! Processed {processed_count} of {total_links} links."))
@@ -226,6 +289,106 @@ class LinkManager:
             error_msg = f"Error processing links: {str(e)}"
             progress_queue.put(("status", error_msg))
             raise
+
+    def _process_batch(self, batch, temp_dir, temp_extract_dir, output_dir,
+                      progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso):
+        """Process a batch of links."""
+        for link in batch:
+            try:
+                # Skip disabled games
+                if not link.get('enabled', True):
+                    status_msg = f"Skipping disabled game: {link.get('name', 'Unknown')}"
+                    if self._should_update_status(status_msg):
+                        progress_queue.put(("status", status_msg))
+                    continue
+                
+                # Get game name
+                game_name = link.get('name', os.path.basename(link['url']))
+                status_msg = f"Processing {game_name}"
+                if self._should_update_status(status_msg):
+                    progress_queue.put(("status", status_msg))
+                
+                # Download file
+                file_path = self._download_file(link['url'], temp_dir, progress_queue)
+                if not file_path:
+                    continue
+                
+                # Extract if needed
+                extract_dir = os.path.join(temp_extract_dir, os.path.basename(file_path))
+                if self._extract_file(file_path, extract_dir, progress_queue):
+                    # Copy to output
+                    if self._copy_to_output(extract_dir, output_dir, progress_queue):
+                        # Update link status
+                        link['downloaded'] = True
+                        link['extracted'] = True
+                        link['copied'] = True
+                        link['processed'] = True
+                        link['output_path'] = os.path.join(output_dir, game_name)
+                        
+                        # Handle GOD conversion if requested
+                        if convert_god and link.get('link_type', '').lower() == 'iso':
+                            god_output_dir = os.path.join(output_dir, 'god_converted')
+                            os.makedirs(god_output_dir, exist_ok=True)
+                            
+                            # Find the ISO file using flexible matching
+                            iso_path = self._find_matching_iso(output_dir, game_name)
+                            
+                            if iso_path:
+                                progress_queue.put(("status", f"Found ISO file: {os.path.basename(iso_path)}"))
+                                game_god_dir = os.path.join(god_output_dir, game_name)
+                                
+                                # Convert to GOD format
+                                from operations.iso2god import ISO2GODConverter
+                                converter = ISO2GODConverter()
+                                god_path = converter.convert_iso_to_god(
+                                    iso_path=iso_path,
+                                    output_dir=game_god_dir,
+                                    progress_queue=progress_queue,
+                                    trim=trim_iso
+                                )
+                                
+                                if god_path:
+                                    link['god_converted'] = True
+                                    link['god_conversion_date'] = datetime.now().isoformat()
+                                    link['god_output_path'] = god_path
+                                    progress_queue.put(("status", f"Successfully converted to GOD: {game_name}"))
+                                    
+                                    # Delete ISO if requested and conversion was successful
+                                    if delete_iso:
+                                        try:
+                                            os.remove(iso_path)
+                                            progress_queue.put(("status", f"Deleted original ISO after successful conversion: {os.path.basename(iso_path)}"))
+                                        except Exception as e:
+                                            progress_queue.put(("status", f"Warning: Could not delete ISO {os.path.basename(iso_path)}: {e}"))
+                                else:
+                                    progress_queue.put(("status", f"Failed to convert {os.path.basename(iso_path)} to GOD format"))
+                            else:
+                                progress_queue.put(("status", f"Error: Could not find ISO file for {game_name} in {output_dir}"))
+                        
+                        # Save progress after each successful game
+                        with open(links_file, 'w', encoding='utf-8') as f:
+                            json.dump(links_data, f, indent=4)
+                        
+                        # Show success immediately
+                        progress_queue.put(("status", f"Successfully processed: {game_name}"))
+                
+                # Cleanup
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    status_msg = f"Cleaned up download: {game_name}"
+                    if self._should_update_status(status_msg):
+                        progress_queue.put(("status", status_msg))
+                if os.path.exists(extract_dir):
+                    shutil.rmtree(extract_dir)
+                    status_msg = f"Cleaned up extraction: {game_name}"
+                    if self._should_update_status(status_msg):
+                        progress_queue.put(("status", status_msg))
+                
+            except Exception as e:
+                # Show errors immediately
+                error_msg = f"Error processing {link.get('name', 'Unknown')}: {str(e)}"
+                progress_queue.put(("status", error_msg))
+                continue
     
     def _validate_download(self, file_path: str, expected_url: str, progress_queue: Queue) -> bool:
         """Validate that the downloaded file matches what we expect.
@@ -348,21 +511,45 @@ class LinkManager:
             import zipfile
             import tarfile
             
+            # Decode URL-encoded characters in the filename
             filename = os.path.basename(file_path)
-            extract_dir = os.path.join(temp_extract_dir, os.path.splitext(filename)[0])
+            decoded_filename = urllib.parse.unquote(filename)
+            
+            # Create a clean extract directory name
+            base_name = os.path.splitext(decoded_filename)[0]
+            extract_dir = os.path.join(temp_extract_dir, base_name)
+            
+            # Ensure the directory exists
             os.makedirs(extract_dir, exist_ok=True)
             
             if filename.endswith('.zip'):
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
+                    # Get list of files in zip
+                    file_list = zip_ref.namelist()
+                    
+                    # Extract each file, decoding the names
+                    for file in file_list:
+                        # Decode the filename from the zip
+                        decoded_name = urllib.parse.unquote(file)
+                        # Get the target extraction path
+                        target_path = os.path.join(extract_dir, decoded_name)
+                        # Ensure the parent directory exists
+                        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                        # Extract the file
+                        with zip_ref.open(file) as source, open(target_path, 'wb') as target:
+                            shutil.copyfileobj(source, target)
+                            
             elif filename.endswith(('.tar', '.tar.gz', '.tgz')):
                 with tarfile.open(file_path, 'r:*') as tar_ref:
-                    tar_ref.extractall(extract_dir)
+                    # Similar handling for tar files
+                    for member in tar_ref.getmembers():
+                        member.name = urllib.parse.unquote(member.name)
+                        tar_ref.extract(member, extract_dir)
             else:
-                progress_queue.put(("status", f"Unsupported archive format: {filename}"))
+                progress_queue.put(("status", f"Unsupported archive format: {decoded_filename}"))
                 return None
             
-            progress_queue.put(("status", f"Extracted {filename}"))
+            progress_queue.put(("status", f"Extracted {decoded_filename}"))
             return extract_dir
         
         except Exception as e:
@@ -376,10 +563,16 @@ class LinkManager:
             for root, _, files in os.walk(source_dir):
                 for file in files:
                     src_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(root, source_dir)
-                    dst_dir = os.path.join(output_dir, rel_path)
-                    os.makedirs(dst_dir, exist_ok=True)
-                    dst_path = os.path.join(dst_dir, file)
+                    
+                    # For ISO files, preserve the original name
+                    if file.lower().endswith('.iso'):
+                        dst_path = os.path.join(output_dir, file)
+                    else:
+                        # For other files, preserve directory structure
+                        rel_path = os.path.relpath(root, source_dir)
+                        dst_dir = os.path.join(output_dir, rel_path)
+                        os.makedirs(dst_dir, exist_ok=True)
+                        dst_path = os.path.join(dst_dir, file)
                     
                     shutil.copy2(src_path, dst_path)
                     progress_queue.put(("status", f"Copied {file}"))
@@ -389,6 +582,38 @@ class LinkManager:
         except Exception as e:
             progress_queue.put(("status", f"Error copying files: {str(e)}"))
             return False
+    
+    def _find_matching_iso(self, output_dir: str, game_name: str) -> Optional[str]:
+        """Find an ISO file that matches the game name, using flexible matching."""
+        try:
+            # Get all ISO files in the directory
+            iso_files = [f for f in os.listdir(output_dir) if f.lower().endswith('.iso')]
+            
+            for iso_file in iso_files:
+                # Try exact match first
+                if iso_file == game_name + '.iso':
+                    return os.path.join(output_dir, iso_file)
+                
+                # Try case-insensitive match
+                if iso_file.lower() == (game_name + '.iso').lower():
+                    return os.path.join(output_dir, iso_file)
+                
+                # Try matching without special characters
+                clean_iso = ''.join(c.lower() for c in iso_file if c.isalnum())
+                clean_game = ''.join(c.lower() for c in game_name if c.isalnum())
+                if clean_iso.startswith(clean_game):
+                    return os.path.join(output_dir, iso_file)
+                
+                # Try original filename without sanitization
+                base_iso = os.path.splitext(iso_file)[0]
+                if base_iso == game_name:
+                    return os.path.join(output_dir, iso_file)
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error finding ISO: {e}")
+            return None
     
     def _update_processing_log(self, url: str, file_path: str,
                              extract_dir: str) -> None:

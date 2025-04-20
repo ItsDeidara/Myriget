@@ -1,7 +1,13 @@
 # Links and configuration files
+links.json
+links.json.bak
+settings.json
 src/config/links.json
 src/config/links.json.bak
 src/config/settings.json
+**/links.json
+**/links.json.bak
+**/settings.json
 
 # Python
 __pycache__/

@@ -2,6 +2,7 @@ import os
 import json
 from typing import Optional
 from datetime import datetime
+import multiprocessing
 
 class AppConfig:
     """Application configuration management."""
@@ -20,19 +21,27 @@ class AppConfig:
         
         # Default values
         self.links_file = os.path.join(self.config_dir, "links.json")
-        self.batch_size = 500
+        self.batch_size = 10240  # Default to 10GB
         self.batch_size_mb = 10000
         self.copy_timeout = 3600
         self.per_file_timeout = 300
         self.delete_after_copy = True
         self.batch_mode = "By Size (MB)"
-        self.filter_type = "All"
+        self.filter_type = "Incomplete"
         self.link_type = "ISO"
         
+        # ISO2GOD settings
+        self.iso_dir = ""
+        self.god_dir = ""
+        self.iso2god_threads = max(4, multiprocessing.cpu_count() - 1)  # Default to CPU cores - 1, minimum 4
+        self.iso2god_trim = True
+        self.iso2god_delete_iso = False
+        self.iso2god_delete_source = False
+        
         # Library size tracking
-        self.iso_size_gb = 0.0
-        self.xbla_size_gb = 0.0
-        self.xbla_addons_size_gb = 0.0
+        self.iso_size_gb = 0
+        self.xbla_size_gb = 0
+        self.xbla_addons_size_gb = 0
         self.last_size_check = None
         self.missing_size_iso = 0
         self.missing_size_xbla = 0
@@ -192,7 +201,13 @@ class AppConfig:
                 "last_size_check": self.last_size_check,
                 "missing_size_iso": getattr(self, 'missing_size_iso', 0),
                 "missing_size_xbla": getattr(self, 'missing_size_xbla', 0),
-                "missing_size_xbla_addons": getattr(self, 'missing_size_xbla_addons', 0)
+                "missing_size_xbla_addons": getattr(self, 'missing_size_xbla_addons', 0),
+                "iso_dir": self.iso_dir,
+                "god_dir": self.god_dir,
+                "iso2god_threads": self.iso2god_threads,
+                "iso2god_trim": self.iso2god_trim,
+                "iso2god_delete_iso": self.iso2god_delete_iso,
+                "iso2god_delete_source": self.iso2god_delete_source
             }
             
             # Ensure config directory exists
@@ -249,6 +264,12 @@ class AppConfig:
                     self.missing_size_iso = config.get("missing_size_iso", 0)
                     self.missing_size_xbla = config.get("missing_size_xbla", 0)
                     self.missing_size_xbla_addons = config.get("missing_size_xbla_addons", 0)
+                    self.iso_dir = config.get("iso_dir", "")
+                    self.god_dir = config.get("god_dir", "")
+                    self.iso2god_threads = config.get("iso2god_threads", max(4, multiprocessing.cpu_count() - 1))
+                    self.iso2god_trim = config.get("iso2god_trim", True)
+                    self.iso2god_delete_iso = config.get("iso2god_delete_iso", False)
+                    self.iso2god_delete_source = config.get("iso2god_delete_source", False)
             else:
                 print("No config file found, using default values")
                 self.calculate_library_sizes()  # Calculate sizes on first load
@@ -277,7 +298,13 @@ class AppConfig:
                 "last_size_check": self.last_size_check,
                 "missing_size_iso": self.missing_size_iso,
                 "missing_size_xbla": self.missing_size_xbla,
-                "missing_size_xbla_addons": self.missing_size_xbla_addons
+                "missing_size_xbla_addons": self.missing_size_xbla_addons,
+                "iso_dir": self.iso_dir,
+                "god_dir": self.god_dir,
+                "iso2god_threads": self.iso2god_threads,
+                "iso2god_trim": self.iso2god_trim,
+                "iso2god_delete_iso": self.iso2god_delete_iso,
+                "iso2god_delete_source": self.iso2god_delete_source
             }
             
             # Ensure config directory exists

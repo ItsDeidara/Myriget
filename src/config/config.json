@@ -1,7 +1,7 @@
 {
-    "temp_dir": "C:/Users/jarch/discord-screenshotU/tempDownload",
-    "temp_extract_dir": "C:/Users/jarch/discord-screenshotU/tempExtract",
-    "output_dir": "G:/eristaMate/tempOutputLocation",
+    "temp_dir": "G:\\eristaMate\\tempDownload",
+    "temp_extract_dir": "G:\\eristaMate\\tempExportLocation",
+    "output_dir": "G:\\eristaMate\\tempOutputLocation",
     "links_file": "c:\\Users\\jarch\\discord-screenshotU\\src\\config\\links.json",
     "batch_size": 500,
     "batch_size_mb": 50000,
@@ -11,11 +11,17 @@
     "batch_mode": "By Size (MB)",
     "filter_type": "All",
     "link_type": "ISO",
-    "iso_size_gb": 8810.30219865311,
+    "iso_size_gb": 8783.531233098358,
     "xbla_size_gb": 0.0,
     "xbla_addons_size_gb": 0.0,
-    "last_size_check": "2025-04-19T20:58:27.720566",
+    "last_size_check": "2025-04-20T00:25:04.339362",
     "missing_size_iso": 0,
     "missing_size_xbla": 0,
-    "missing_size_xbla_addons": 0
+    "missing_size_xbla_addons": 0,
+    "iso_dir": "G:/eristaMate/tempOutputLocation",
+    "god_dir": "G:/eristaMate/tempOutputLocation/god_converted",
+    "iso2god_threads": 15,
+    "iso2god_trim": true,
+    "iso2god_delete_iso": false,
+    "iso2god_delete_source": false
 }

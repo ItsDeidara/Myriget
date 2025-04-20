@@ -4,6 +4,7 @@ from typing import Optional, List
 from queue import Queue
 import shutil
 import time
+import multiprocessing  # Add this import
 
 class ISO2GODConverter:
     """Handles ISO to GOD conversion operations."""
@@ -11,7 +12,36 @@ class ISO2GODConverter:
     def __init__(self):
         """Initialize the converter with default settings."""
         self.last_status_time = 0  # Track last status update time
-    
+        
+        # Find iso2god executable
+        self.iso2god_path = self._find_iso2god()
+        if not self.iso2god_path:
+            raise Exception("iso2god executable not found. Please ensure it is installed and in the tools directory.")
+            
+        # Calculate optimal thread count (physical cores - 1, minimum 2)
+        self.optimal_threads = max(2, multiprocessing.cpu_count() - 1)
+
+    def _find_iso2god(self) -> Optional[str]:
+        """Find the iso2god executable."""
+        # Check in the tools directory next to main.py
+        tools_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tools')
+        possible_paths = [
+            os.path.join(tools_dir, 'iso2god.exe'),  # Windows executable
+            os.path.join(tools_dir, 'iso2god'),      # Linux/Mac executable
+            'iso2god.exe',  # In PATH (Windows)
+            'iso2god'       # In PATH (Linux/Mac)
+        ]
+        
+        # Create tools directory if it doesn't exist
+        os.makedirs(tools_dir, exist_ok=True)
+        
+        # Try each possible path
+        for path in possible_paths:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+            
+        return None
+
     def _should_update_status(self, message: str = "") -> bool:
         """Check if status should be updated based on message type and timing."""
         # Always show important messages immediately
@@ -30,54 +60,112 @@ class ISO2GODConverter:
             return True
         return False
     
-    def convert_iso(self, iso_path: str, output_dir: str, progress_queue: Queue,
-                   game_title: Optional[str] = None, num_threads: int = 4,
-                   trim: bool = True) -> bool:
-        """Convert an ISO file to GOD format.
-        
-        Args:
-            iso_path: Path to the ISO file
-            output_dir: Directory to save the GOD files
-            progress_queue: Queue for progress updates
-            game_title: Optional game title to use
-            num_threads: Number of threads to use for conversion
-            trim: Whether to trim unused space from the ISO
-            
-        Returns:
-            bool: True if conversion was successful
-        """
+    def convert_iso_to_god(self, iso_path: str, output_dir: str, progress_queue: Queue,
+                         game_title: Optional[str] = None, num_threads: Optional[int] = None,
+                         trim: bool = True) -> Optional[str]:
+        """Convert an ISO file to GOD format."""
         try:
+            # Use optimal thread count if none specified
+            if num_threads is None:
+                num_threads = self.optimal_threads
+                progress_queue.put(("status", f"Using optimal thread count: {num_threads}"))
+            
             # Validate paths
             if not os.path.exists(iso_path):
                 progress_queue.put(("status", f"Error: ISO file not found: {iso_path}"))
-                return False
+                return None
             
             # Create output directory if it doesn't exist
             os.makedirs(output_dir, exist_ok=True)
             
-            # Build iso2god command
-            cmd = ["iso2god"]
+            # Build iso2god command using the found executable path
+            cmd = [self.iso2god_path]
+            
+            # Add optional parameters
             if game_title:
                 cmd.extend(["--game-title", game_title])
             if trim:
                 cmd.append("--trim")
-            cmd.extend(["-j", str(num_threads)])
+            if num_threads > 1:
+                cmd.extend(["-j", str(num_threads)])
+            
+            # Add required parameters
             cmd.extend([iso_path, output_dir])
             
-            # Run conversion
+            # Run conversion with real-time output monitoring
             progress_queue.put(("status", f"Converting {os.path.basename(iso_path)} to GOD format..."))
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            progress_queue.put(("status", f"Using command: {' '.join(cmd)}"))
             
-            if result.returncode == 0:
+            try:
+                # Use Popen for real-time output monitoring
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,  # Line buffered
+                    universal_newlines=True
+                )
+                
+                last_activity = time.time()
+                while True:
+                    # Check stdout
+                    output = process.stdout.readline()
+                    if output:
+                        progress_queue.put(("status", f"iso2god: {output.strip()}"))
+                        last_activity = time.time()
+                    
+                    # Check stderr
+                    error = process.stderr.readline()
+                    if error:
+                        progress_queue.put(("status", f"iso2god error: {error.strip()}"))
+                        last_activity = time.time()
+                    
+                    # Check if process has finished
+                    if process.poll() is not None:
+                        break
+                    
+                    # Check for timeout (no activity for 5 minutes)
+                    if time.time() - last_activity > 300:  # 5 minutes
+                        process.kill()
+                        progress_queue.put(("status", "Error: Process appears to be frozen (no activity for 5 minutes). Terminating."))
+                        return None
+                    
+                    # Small sleep to prevent CPU spinning
+                    time.sleep(0.1)
+                
+                # Get remaining output
+                remaining_out, remaining_err = process.communicate()
+                if remaining_out:
+                    progress_queue.put(("status", f"iso2god final output: {remaining_out.strip()}"))
+                if remaining_err:
+                    progress_queue.put(("status", f"iso2god final error: {remaining_err.strip()}"))
+                
+                # Check return code
+                if process.returncode != 0:
+                    progress_queue.put(("status", f"Error: iso2god failed with return code {process.returncode}"))
+                    return None
+                
+            except subprocess.CalledProcessError as e:
+                progress_queue.put(("status", f"Error converting {os.path.basename(iso_path)}: {e.stderr}"))
+                return None
+            except Exception as e:
+                progress_queue.put(("status", f"Error running iso2god: {str(e)}"))
+                return None
+            
+            # Find the converted GOD file
+            god_files = [f for f in os.listdir(output_dir) if f.endswith('.000')]
+            if god_files:
+                god_path = os.path.join(output_dir, god_files[0])
                 progress_queue.put(("status", f"Successfully converted {os.path.basename(iso_path)}"))
-                return True
+                return god_path
             else:
-                progress_queue.put(("status", f"Error converting {os.path.basename(iso_path)}: {result.stderr}"))
-                return False
+                progress_queue.put(("status", f"Error: No GOD files found after conversion: {os.path.basename(iso_path)}"))
+                return None
                 
         except Exception as e:
             progress_queue.put(("status", f"Error during conversion: {str(e)}"))
-            return False
+            return None
     
     def batch_convert(self, iso_dir: str, output_dir: str, progress_queue: Queue,
                      batch_size: int = 1, num_threads: int = 4, trim: bool = True) -> None:
@@ -120,8 +208,8 @@ class ISO2GODConverter:
                     # Get game title from filename
                     game_title = os.path.splitext(iso_file)[0].replace('_', ' ')
                     
-                    if self.convert_iso(iso_path, game_output_dir, progress_queue,
-                                      game_title, num_threads, trim):
+                    if self.convert_iso_to_god(iso_path, game_output_dir, progress_queue,
+                                            game_title, num_threads, trim):
                         # Update progress
                         progress = ((i + j + 1) / total_files) * 100
                         progress_queue.put(("progress", progress))
