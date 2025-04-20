@@ -210,19 +210,21 @@ class LinkManager:
             current_batch = 1
             
             if batch_mode == "By Size (MB)":
-                # Calculate total batches based on total size
-                total_size_mb = sum(link.get('size_bytes', 0) / (1024 * 1024) for link in links_data)
-                total_batches = max(1, int((total_size_mb + batch_size - 1) // batch_size))
-                
-                # Process by size
-                current_batch_links = []
-                current_batch_size_mb = 0
-                
                 # Sort links by size (largest first) to optimize batch filling
                 links_with_size = [(link, link.get('size_bytes', 0) / (1024 * 1024)) for link in links_data]
                 remaining_links = sorted(links_with_size, key=lambda x: x[1], reverse=True)
                 
-                while remaining_links:
+                # Calculate total size to process (limited by batch_size)
+                total_size_mb = min(
+                    sum(size for _, size in remaining_links),
+                    batch_size  # This is now the total size limit
+                )
+                total_batches = max(1, int((total_size_mb + 10240 - 1) // 10240))  # Use 10GB as batch size
+                
+                current_batch_links = []
+                current_batch_size_mb = 0
+                
+                while remaining_links and processed_count < total_size_mb:  # Stop when we hit the total size limit
                     # Try to find the best fit for remaining space in current batch
                     best_fit = None
                     best_fit_size = 0
@@ -230,8 +232,12 @@ class LinkManager:
                     
                     # Look through remaining links to find best fit
                     for i, (link, size_mb) in enumerate(remaining_links):
-                        # If this link fits and is better than current best fit
-                        if current_batch_size_mb + size_mb <= batch_size:
+                        # Check if adding this would exceed total size limit
+                        if processed_count + size_mb > total_size_mb:
+                            continue
+                            
+                        # If this link fits in current batch and is better than current best fit
+                        if current_batch_size_mb + size_mb <= 10240:  # Use 10GB as batch size
                             if size_mb > best_fit_size:
                                 best_fit = link
                                 best_fit_size = size_mb
@@ -241,14 +247,16 @@ class LinkManager:
                     if best_fit is not None:
                         current_batch_links.append(best_fit)
                         current_batch_size_mb += best_fit_size
+                        processed_count += best_fit_size
                         remaining_links.pop(best_fit_index)
                         
-                        # If we're close enough to batch size or this is last item, process batch
-                        if (current_batch_size_mb >= batch_size * 0.9 or  # 90% full
+                        # If current batch is full or this is last item, process batch
+                        if (current_batch_size_mb >= 10240 * 0.9 or  # 90% of 10GB
                             not remaining_links or  # no more links
-                            current_batch_size_mb + min(size for _, size in remaining_links) > batch_size):  # can't fit smallest remaining
+                            (remaining_links and current_batch_size_mb + min(size for _, size in remaining_links) > 10240) or  # can't fit smallest remaining
+                            processed_count >= total_size_mb):  # hit total size limit
                             
-                            progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(current_batch_links)} links, {current_batch_size_mb:.2f} MB)"))
+                            progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(current_batch_links)} links, {current_batch_size_mb:.2f} MB) - Total: {processed_count:.2f} MB"))
                             self._process_batch(current_batch_links, temp_dir, temp_extract_dir, output_dir,
                                              progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso)
                             processed_count += len(current_batch_links)
@@ -258,31 +266,55 @@ class LinkManager:
                             current_batch_size_mb = 0
                             current_batch += 1
                     else:
-                        # If no links fit in remaining space, force start new batch with largest remaining
+                        # If no links fit in remaining space, force start new batch with largest remaining that fits total limit
                         if current_batch_links:  # Process current batch if it exists
-                            progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(current_batch_links)} links, {current_batch_size_mb:.2f} MB)"))
+                            progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(current_batch_links)} links, {current_batch_size_mb:.2f} MB) - Total: {processed_count:.2f} MB"))
                             self._process_batch(current_batch_links, temp_dir, temp_extract_dir, output_dir,
                                              progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso)
                             processed_count += len(current_batch_links)
                             current_batch += 1
                         
-                        # Start new batch with largest remaining link
-                        link, size_mb = remaining_links.pop(0)
-                        current_batch_links = [link]
-                        current_batch_size_mb = size_mb
+                        # Find largest remaining link that fits within total size limit
+                        while remaining_links:
+                            link, size_mb = remaining_links[0]
+                            if processed_count + size_mb <= total_size_mb:
+                                remaining_links.pop(0)
+                                current_batch_links = [link]
+                                current_batch_size_mb = size_mb
+                                processed_count += size_mb
+                                break
+                            remaining_links.pop(0)  # Remove links that are too large
+                
+                # Process any final batch
+                if current_batch_links:
+                    progress_queue.put(("status", f"Processing final batch {current_batch} of {total_batches} ({len(current_batch_links)} links, {current_batch_size_mb:.2f} MB) - Total: {processed_count:.2f} MB"))
+                    self._process_batch(current_batch_links, temp_dir, temp_extract_dir, output_dir,
+                                     progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso)
+                    processed_count += len(current_batch_links)
             else:
-                # Process by number
-                total_batches = (total_links + batch_size - 1) // batch_size
-                for i in range(0, total_links, batch_size):
-                    batch = links_data[i:i + batch_size]
-                    progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(batch)} links)"))
+                # Process by number - limit total number of links to batch_size
+                total_to_process = min(batch_size, total_links)  # Don't process more than batch_size links
+                total_batches = (total_to_process + 49) // 50  # Process in batches of 50
+                
+                # Only process up to the number limit
+                links_to_process = links_data[:total_to_process]
+                
+                # Process in smaller batches of 50 for better progress tracking
+                for i in range(0, total_to_process, 50):
+                    batch = links_to_process[i:min(i + 50, total_to_process)]
+                    progress_queue.put(("status", f"Processing batch {current_batch} of {total_batches} ({len(batch)} links) - Total: {processed_count + len(batch)} of {total_to_process}"))
                     self._process_batch(batch, temp_dir, temp_extract_dir, output_dir,
                                      progress_queue, links_file, links_data, convert_god, delete_iso, trim_iso)
                     processed_count += len(batch)
-                    current_batch += 1
+                    
+                    if processed_count >= total_to_process:
+                        break
             
             # Show completion immediately
-            progress_queue.put(("status", f"Processing complete! Processed {processed_count} of {total_links} links."))
+            if batch_mode == "By Number":
+                progress_queue.put(("status", f"Processing complete! Processed {processed_count} links (number limit: {batch_size})"))
+            else:
+                progress_queue.put(("status", f"Processing complete! Processed {processed_count} of {total_links} links."))
             
         except Exception as e:
             # Show errors immediately
