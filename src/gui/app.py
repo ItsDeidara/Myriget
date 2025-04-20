@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import queue
 import threading
 import webbrowser
@@ -9,6 +9,7 @@ import json
 from datetime import datetime
 import requests
 import shutil
+import time
 
 from operations.downloader import FileDownloader
 from operations.extractor import FileExtractor
@@ -16,6 +17,7 @@ from operations.copier import FileCopier
 from config.settings import AppConfig
 from utils.logger import Logger
 from models.link import LinkManager
+from operations.iso2god import ISO2GODConverter  # Fixed import path
 
 class ExpandableFrame(ttk.Frame):
     """A frame that can be expanded/collapsed with a smooth animation."""
@@ -63,6 +65,36 @@ class ExpandableFrame(ttk.Frame):
 
 class DownloaderApp:
     """Main application class for the file downloader and extractor."""
+    
+    # Define schema as a class variable
+    LINK_SCHEMA = {
+        # Common fields for all link types
+        'common': {
+            'url': '',
+            'link_type': 'Unknown',
+            'name': '',
+            'size_bytes': 0,
+            'enabled': True,
+            'processed': False,
+            'downloaded': False,
+            'extracted': False,
+            'deleted': False,
+            'copied': False,
+            'imported': False,
+            'import_date': None,
+            'output_path': None
+        },
+        # Additional fields for ISO files
+        'iso': {
+            'god_converted': False,
+            'god_conversion_date': None,
+            'god_output_path': None,
+            'god_conversion_error': None,
+            'god_conversion_progress': 0,
+            'god_conversion_started': False,
+            'god_conversion_completed': False
+        }
+    }
     
     def __init__(self, root: tk.Tk):
         """Initialize the application with its main components."""
@@ -240,30 +272,34 @@ class DownloaderApp:
         main_container = ttk.Frame(self.notebook)
         tools_container = ttk.Frame(self.notebook)
         settings_container = ttk.Frame(self.notebook)
-        games_container = ttk.Frame(self.notebook)  # New games tab container
+        games_container = ttk.Frame(self.notebook)
+        iso2god_container = ttk.Frame(self.notebook)  # New ISO2GOD container
         
         # Configure grid weights for containers
-        for container in (main_container, settings_container, tools_container, games_container):
+        for container in (main_container, settings_container, tools_container, games_container, iso2god_container):
             container.grid_rowconfigure(0, weight=1)
             container.grid_columnconfigure(0, weight=1)
         
         # Add tabs to notebook in desired order
         self.notebook.add(main_container, text="Main")
-        self.notebook.add(games_container, text="Games")  # Add games tab
+        self.notebook.add(games_container, text="Games")
         self.notebook.add(tools_container, text="Tools")
         self.notebook.add(settings_container, text="Settings")
+        self.notebook.add(iso2god_container, text="ISO2GOD")  # Add ISO2GOD tab
         
         # Create scrollable frames for each tab
         self.main_frame = self._create_scrollable_frame(main_container)
         self.tools_frame = self._create_scrollable_frame(tools_container)
         self.settings_frame = self._create_scrollable_frame(settings_container)
-        self.games_frame = self._create_scrollable_frame(games_container)  # New games frame
+        self.games_frame = self._create_scrollable_frame(games_container)
+        self.iso2god_frame = self._create_scrollable_frame(iso2god_container)  # Create ISO2GOD frame
         
         # Setup content for each tab
         self._setup_main_tab(self.main_frame)
-        self._setup_games_tab(self.games_frame)  # Setup games tab
+        self._setup_games_tab(self.games_frame)
         self._setup_tools_tab(self.tools_frame)
         self._setup_settings_tab(self.settings_frame)
+        self._setup_iso2god_tab(self.iso2god_frame)  # Setup ISO2GOD tab
     
     def _create_scrollable_frame(self, container):
         """Create a scrollable frame that adapts to window size."""
@@ -543,13 +579,13 @@ class DownloaderApp:
         ttk.Label(size_frame, text="Batch Size:").grid(row=0, column=0, padx=5)
         self.batch_entry = ttk.Entry(size_frame, width=10)
         self.batch_entry.grid(row=0, column=1, sticky="w", padx=5)
-        self.batch_entry.insert(0, str(self.config.batch_size))
+        self.batch_entry.insert(0, "10240")  # Default to 10GB instead of 500MB
         
         # Batch mode selection using radiobuttons
         mode_frame = ttk.Frame(parent)
         mode_frame.grid(row=1, column=0, sticky="ew", pady=2)
         
-        self.batch_mode_var = tk.StringVar(value=self.config.batch_mode)
+        self.batch_mode_var = tk.StringVar(value="By Size (MB)")  # Default to size-based batching
         tk.Radiobutton(mode_frame, text="By Number", variable=self.batch_mode_var,
                       value="By Number").pack(side=tk.LEFT, padx=5)
         tk.Radiobutton(mode_frame, text="By Size (MB)", variable=self.batch_mode_var,
@@ -573,15 +609,43 @@ class DownloaderApp:
         filter_frame = ttk.Frame(proc_frame)
         filter_frame.grid(row=2, column=0, sticky="w")
         
-        self.filter_type_var = tk.StringVar(value=self.config.filter_type)
+        self.filter_type_var = tk.StringVar(value="Incomplete")  # Default to Incomplete
         tk.Radiobutton(filter_frame, text="All Files", variable=self.filter_type_var,
                       value="All").pack(side=tk.LEFT, padx=5)
         tk.Radiobutton(filter_frame, text="Incomplete Only", variable=self.filter_type_var,
                       value="Incomplete").pack(side=tk.LEFT, padx=5)
         
+        # ISO2GOD options frame
+        iso_frame = ttk.LabelFrame(parent, text="ISO Processing Options")
+        iso_frame.grid(row=3, column=0, sticky="ew", pady=5)
+        
+        # Convert to GOD option
+        self.convert_god_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            iso_frame,
+            text="Convert ISOs to GOD format after download",
+            variable=self.convert_god_var
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # Delete ISO after conversion option
+        self.delete_iso_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            iso_frame,
+            text="Delete ISO after GOD conversion",
+            variable=self.delete_iso_var
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # Trim ISO option
+        self.trim_iso_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            iso_frame,
+            text="Trim ISOs",
+            variable=self.trim_iso_var
+        ).pack(side=tk.LEFT, padx=5)
+        
         # File type selection
         type_frame = ttk.Frame(parent)
-        type_frame.grid(row=3, column=0, sticky="ew", pady=5)
+        type_frame.grid(row=4, column=0, sticky="ew", pady=5)
         type_frame.grid_columnconfigure(0, weight=1)
         
         ttk.Label(type_frame, text="File Type:", style="Header.TLabel").grid(
@@ -669,16 +733,102 @@ class DownloaderApp:
         ttk.Radiobutton(mode_frame, text="Replace links.json", variable=self.links_mode_var, 
                        value="replace").pack(side=tk.LEFT, padx=5, pady=5)
         
-        # Add generate and estimate buttons
+        # Add action buttons frame
         action_frame = ttk.Frame(button_frame)
         action_frame.pack(side=tk.RIGHT, padx=5)
         
+        # Add validate button with description
+        validate_frame = ttk.LabelFrame(parent, text="Links Validation", padding=5)
+        validate_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        validate_desc = ("Check and fix issues in links.json:\n"
+                        "• Missing or invalid fields\n"
+                        "• ISO2GOD conversion status\n"
+                        "• Processing and download status")
+        ttk.Label(validate_frame, text=validate_desc, wraplength=400).pack(anchor="w", padx=5, pady=2)
+        
+        validate_button_frame = ttk.Frame(validate_frame)
+        validate_button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Button(validate_button_frame, text="Validate Links",
+                  command=self._validate_links_manually).pack(side=tk.LEFT, padx=5)
+        
+        # Add other action buttons
         ttk.Button(action_frame, text="Generate/Update", 
                   command=self._process_links_txt).pack(side=tk.LEFT, padx=5)
         ttk.Button(action_frame, text="Calculate Library Size", 
                   command=self._calculate_sizes).pack(side=tk.LEFT, padx=5)
         ttk.Button(action_frame, text="Merge 2 Links.json Files", 
                   command=self._merge_links_file).pack(side=tk.LEFT, padx=5)
+
+    def _validate_links_manually(self):
+        """Manually validate and fix links.json."""
+        try:
+            # First check if links.json exists
+            if not os.path.exists(self.config.links_file):
+                messagebox.showerror(
+                    "Error",
+                    "links.json not found. Please generate it first using the URLs file."
+                )
+                return
+            
+            # Run validation
+            validation_errors = []
+            validation_warnings = []
+            
+            with open(self.config.links_file, 'r', encoding='utf-8') as f:
+                links_data = json.load(f)
+                
+                if not isinstance(links_data, list):
+                    validation_errors.append("• Invalid links.json format: expected a list of links")
+                else:
+                    # Check for common issues that we can fix
+                    for link in links_data:
+                        if not isinstance(link, dict):
+                            validation_errors.append("• Invalid link format in links.json")
+                            break
+                        
+                        # Check for required URL field
+                        if 'url' not in link:
+                            validation_errors.append("• Missing URL in one or more links")
+                            break
+                        
+                        # Check common fields
+                        for field in self.LINK_SCHEMA['common']:
+                            if field not in link:
+                                validation_warnings.append(f"• Some links are missing the '{field}' field")
+                        
+                        # Check ISO-specific fields
+                        if link.get('link_type', '').upper() == 'ISO':
+                            for field in self.LINK_SCHEMA['iso']:
+                                if field not in link:
+                                    validation_warnings.append(f"• Some ISO files are missing the '{field}' field")
+            
+            if validation_errors:
+                error_message = "The following errors were found:\n\n" + "\n".join(validation_errors)
+                messagebox.showerror("Validation Errors", error_message)
+                return
+            
+            if validation_warnings:
+                # Remove duplicates while preserving order
+                validation_warnings = list(dict.fromkeys(validation_warnings))
+                
+                warning_message = ("The following issues were found that can be fixed:\n\n" + 
+                                 "\n".join(validation_warnings) +
+                                 "\n\nWould you like to fix these issues now?")
+                
+                if messagebox.askyesno("Fix Issues", warning_message):
+                    self._fix_links_issues()
+            else:
+                messagebox.showinfo(
+                    "Validation Complete",
+                    "No issues found in links.json. All required fields are present."
+                )
+            
+        except json.JSONDecodeError:
+            messagebox.showerror("Error", "links.json is not valid JSON")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error validating links.json: {str(e)}")
     
     def _add_import_control(self, parent: tk.Widget) -> None:
         """Add import controls to the frame."""
@@ -706,17 +856,22 @@ class DownloaderApp:
                 if msg_type == "status":
                     self._update_status(msg)
                 elif msg_type == "progress":
-                    self.progress_bar['value'] = msg
-                    self.progress_label.config(text=f"Progress: {msg:.1f}%")
+                    def update_progress():
+                        try:
+                            self.progress_bar['value'] = msg
+                            self.progress_label.config(text=f"Progress: {msg:.1f}%")
+                            self.root.update_idletasks()
+                        except Exception as e:
+                            print(f"Error updating progress: {e}")
                     
-                    # Force GUI update
-                    self.root.update_idletasks()
+                    # Schedule progress updates on main thread
+                    self.root.after(0, update_progress)
         except queue.Empty:
             pass
         except Exception as e:
             self.logger.log(f"Error updating progress: {e}")
         
-        # Schedule next update
+        # Schedule next update with a longer delay to reduce GUI load
         self.root.after(100, self._update_progress)
     
     def _browse_temp(self) -> None:
@@ -773,18 +928,35 @@ class DownloaderApp:
             "Ready to start processing.\n\n"
             f"File Type: {self.link_type_var.get()}\n"
             f"Processing Mode: {self.filter_type_var.get()}\n"
-            f"Batch Mode: {self.batch_mode_var.get()}\n\n"
+            f"Batch Mode: {self.batch_mode_var.get()}\n"
+            f"Batch Size: {self.config.batch_size}\n\n"
+            f"Download Directory: {self.config.temp_dir}\n"
+            f"Extract Directory: {self.config.temp_extract_dir}\n"
+            f"Output Directory: {self.config.output_dir}\n\n"
             "Would you like to proceed?"
         )
         
         if not messagebox.askyesno("Confirm Processing", confirm_msg):
             return
         
+        # Create directories if they don't exist
+        try:
+            os.makedirs(self.config.temp_dir, exist_ok=True)
+            os.makedirs(self.config.temp_extract_dir, exist_ok=True)
+            os.makedirs(self.config.output_dir, exist_ok=True)
+        except Exception as e:
+            self.logger.log(f"Error creating directories: {e}")
+            messagebox.showerror("Error", f"Failed to create directories: {e}")
+            return
+        
+        self._update_status("Starting processing...")
         self.processing = True
         self.start_button.config(state='disabled')
         self.progress_bar['value'] = 0
         
-        threading.Thread(target=self._process_links, daemon=True).start()
+        # Start processing in a daemon thread
+        processing_thread = threading.Thread(target=self._process_links, daemon=True)
+        processing_thread.start()
     
     def _validate_settings(self) -> bool:
         """Validate application settings and provide helpful feedback."""
@@ -818,18 +990,21 @@ class DownloaderApp:
                                 validation_errors.append("• Invalid link format in links.json")
                                 break
                             
+                            # Check for required URL field
                             if 'url' not in link:
                                 validation_errors.append("• Missing URL in one or more links")
                                 break
                             
-                            if 'link_type' not in link:
-                                validation_warnings.append("• Some links are missing type information")
+                            # Check common fields
+                            for field in self.LINK_SCHEMA['common']:
+                                if field not in link:
+                                    validation_warnings.append(f"• Some links are missing the '{field}' field")
                             
-                            if 'size_bytes' not in link or not link['size_bytes']:
-                                validation_warnings.append("• Some links are missing size information")
-                            
-                            if 'processed' not in link:
-                                validation_warnings.append("• Some links are missing processing status")
+                            # Check ISO-specific fields
+                            if link.get('link_type', '').upper() == 'ISO':
+                                for field in self.LINK_SCHEMA['iso']:
+                                    if field not in link:
+                                        validation_warnings.append(f"• Some ISO files are missing the '{field}' field")
             
             except json.JSONDecodeError:
                 validation_errors.append("• links.json is not valid JSON")
@@ -854,7 +1029,7 @@ class DownloaderApp:
             
             if messagebox.askyesno("Fix Issues", warning_message):
                 self._fix_links_issues()
-                return False  # Return False to prevent processing until fixes are applied
+                return False
         
         return True
     
@@ -870,28 +1045,33 @@ class DownloaderApp:
                 json.dump(links_data, f, indent=4)
             
             modified = False
+            fixed_links = []
+            
             for link in links_data:
                 if not isinstance(link, dict):
                     continue
                 
-                # Add missing link type
-                if 'link_type' not in link:
-                    link['link_type'] = 'Unknown'
+                # Create a new link with all required fields
+                fixed_link = {}
+                
+                # Add all common fields with their default values if missing
+                for field, default_value in self.LINK_SCHEMA['common'].items():
+                    fixed_link[field] = link.get(field, default_value)
+                
+                # If it's an ISO file, add ISO-specific fields
+                if link.get('link_type', '').upper() == 'ISO':
+                    for field, default_value in self.LINK_SCHEMA['iso'].items():
+                        fixed_link[field] = link.get(field, default_value)
+                
+                # Check if any fields were added or modified
+                if fixed_link != link:
                     modified = True
                 
-                # Add missing size
-                if 'size_bytes' not in link or not link['size_bytes']:
-                    link['size_bytes'] = 0
-                    modified = True
-                
-                # Add missing processing status
-                if 'processed' not in link:
-                    link['processed'] = False
-                    modified = True
+                fixed_links.append(fixed_link)
             
             if modified:
                 with open(self.config.links_file, 'w', encoding='utf-8') as f:
-                    json.dump(links_data, f, indent=4)
+                    json.dump(fixed_links, f, indent=4)
                 
                 self.logger.log("Fixed issues in links.json")
                 messagebox.showinfo(
@@ -900,7 +1080,8 @@ class DownloaderApp:
                     f"has been saved as {backup_file}\n\n"
                     "You can now:\n"
                     "1. Use 'Estimate Library Size' to update missing file sizes\n"
-                    "2. Start processing to download and extract files"
+                    "2. Start processing to download and extract files\n"
+                    "3. Use the ISO2GOD tab to convert ISO files"
                 )
                 
                 # Recalculate library sizes
@@ -918,6 +1099,77 @@ class DownloaderApp:
     def _process_links(self) -> None:
         """Process links in a separate thread."""
         try:
+            self._update_status("Loading links.json...")
+            
+            # Validate links.json exists
+            if not os.path.exists(self.config.links_file):
+                raise FileNotFoundError("links.json not found")
+            
+            # Load and validate links.json
+            with open(self.config.links_file, 'r', encoding='utf-8') as f:
+                links_data = json.load(f)
+                if not isinstance(links_data, list):
+                    raise ValueError("Invalid links.json format")
+            
+            # Get selected link type
+            link_type = self.link_type_var.get()
+            self._update_status(f"Processing {link_type} files...")
+            
+            # Create ISO2GOD converter if needed
+            convert_god = self.convert_god_var.get() and link_type == "ISO"
+            if convert_god:
+                self.converter = ISO2GODConverter()
+                
+                # Create GOD output directory
+                god_base_dir = os.path.join(self.config.output_dir, "god_converted")
+                os.makedirs(god_base_dir, exist_ok=True)
+                
+                # Check for any downloaded but not converted ISOs
+                for link in links_data:
+                    if (link.get('link_type', '').upper() == 'ISO' and
+                        link.get('downloaded', False) and
+                        link.get('extracted', False) and
+                        not link.get('god_converted', False)):
+                        
+                        game_name = link.get('name', '')
+                        iso_path = os.path.join(self.config.output_dir, game_name + '.iso')
+                        if os.path.exists(iso_path):
+                            self._update_status(f"Found unconverted ISO: {game_name}")
+                            
+                            # Create game-specific output directory in god_converted folder
+                            god_output_dir = os.path.join(god_base_dir, game_name)
+                            os.makedirs(god_output_dir, exist_ok=True)
+                            
+                            # Convert the ISO
+                            self._update_status(f"Converting {game_name} to GOD format...")
+                            success = self.converter.convert_iso(
+                                iso_path=iso_path,
+                                output_dir=god_output_dir,
+                                progress_queue=self.progress_queue,
+                                num_threads=4,  # Default to 4 threads for conversion
+                                trim=self.trim_iso_var.get()
+                            )
+                            
+                            if success:
+                                link['god_converted'] = True
+                                link['god_conversion_date'] = datetime.now().isoformat()
+                                link['god_output_path'] = god_output_dir
+                                
+                                # Delete ISO if requested
+                                if self.delete_iso_var.get():
+                                    try:
+                                        os.remove(iso_path)
+                                        self._update_status(f"Deleted original ISO: {game_name}")
+                                    except Exception as e:
+                                        self._update_status(f"Warning: Could not delete ISO {game_name}: {e}")
+                            else:
+                                link['god_conversion_error'] = "Conversion failed"
+                            
+                            # Save updated status
+                            with open(self.config.links_file, 'w', encoding='utf-8') as f:
+                                json.dump(links_data, f, indent=4)
+            
+            # Process the links
             self.link_manager.process_links(
                 self.config.links_file,
                 self.config.temp_dir,
@@ -925,15 +1177,34 @@ class DownloaderApp:
                 self.config.output_dir,
                 self.config.batch_size,
                 self.progress_queue,
-                self.filter_type_var.get()
+                self.filter_type_var.get(),
+                convert_god=convert_god,
+                delete_iso=self.delete_iso_var.get(),
+                trim_iso=self.trim_iso_var.get(),
+                god_output_dir=os.path.join(self.config.output_dir, "god_converted") if convert_god else None
             )
+            
+            self._update_status("Processing complete!")
+            self.root.after(0, lambda: messagebox.showinfo("Success", "Processing completed successfully!"))
+            
+        except FileNotFoundError as e:
+            error_msg = str(e)
+            self.logger.log(f"File not found: {error_msg}")
+            self._update_status(f"Error: {error_msg}")
+            self.root.after(0, lambda: messagebox.showerror("Error", f"File not found: {error_msg}"))
+        except json.JSONDecodeError as e:
+            error_msg = "Invalid JSON format in links.json"
+            self.logger.log(f"JSON error: {e}")
+            self._update_status(f"Error: {error_msg}")
+            self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
         except Exception as e:
             self.logger.log(f"Error during processing: {str(e)}")
-            messagebox.showerror("Error", f"Processing failed: {e}")
+            self._update_status(f"Error: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Processing failed: {e}"))
         finally:
             self.processing = False
-            self.start_button.config(state='normal')
-            self.progress_queue.put(("progress", 0))
+            self.root.after(0, lambda: self.start_button.config(state='normal'))
+            self.root.after(0, lambda: self.progress_queue.put(("progress", 0)))
     
     def _process_links_txt(self) -> None:
         """Process the links text file to generate/update links.json."""
@@ -1027,6 +1298,448 @@ class DownloaderApp:
         
         self.size_info_text.config(state='disabled')
     
+    def _setup_games_tab(self, parent):
+        """Setup the games management tab."""
+        # Main container with padding
+        container = ttk.Frame(parent)
+        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(1, weight=1)
+        
+        # Header with description
+        header_frame = ttk.Frame(container)
+        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        
+        ttk.Label(header_frame, text="Game Management", style="Header.TLabel").pack(anchor="w")
+        desc_text = ("Manage your game library:\n"
+                    "- Checkbox: Enable/disable games for processing\n"
+                    "- Status: Shows download, extraction, and copy status\n"
+                    "- Click column headers to sort\n"
+                    "- Search using exact words (e.g., 'ace' won't match 'space')\n"
+                    "- Disabled games will be skipped during processing")
+        ttk.Label(header_frame, text=desc_text, wraplength=600).pack(anchor="w", pady=5)
+        
+        # Status count frame
+        self.status_count_frame = ttk.Frame(container)
+        self.status_count_frame.grid(row=1, column=0, sticky="ew", pady=(0, 5))
+        
+        # Control buttons frame
+        button_frame = ttk.Frame(container)
+        button_frame.grid(row=2, column=0, sticky="ew", pady=(0, 5))
+        
+        # Add generate names button
+        ttk.Button(button_frame, text="Generate Game Names",
+                  command=self._generate_game_names).pack(side=tk.LEFT, padx=5)
+        
+        # Add refresh button
+        ttk.Button(button_frame, text="Refresh List",
+                  command=self._load_games).pack(side=tk.LEFT, padx=5)
+        
+        # Search and filter frame
+        search_frame = ttk.Frame(container)
+        search_frame.grid(row=3, column=0, sticky="ew", pady=(0, 5))
+        
+        # Search section
+        search_section = ttk.LabelFrame(search_frame, text="Search Options")
+        search_section.pack(fill=tk.X, padx=5, pady=2)
+        
+        # Search entry
+        search_entry_frame = ttk.Frame(search_section)
+        search_entry_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(search_entry_frame, text="Search:").pack(side=tk.LEFT, padx=5)
+        self.game_search_var = tk.StringVar()
+        self.game_search_var.trace_add("write", self._filter_games)
+        search_entry = ttk.Entry(search_entry_frame, textvariable=self.game_search_var, width=30)
+        search_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Search options
+        options_frame = ttk.Frame(search_section)
+        options_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        # Exact match option
+        self.exact_match_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="Exact Word Match",
+                        variable=self.exact_match_var,
+                        command=self._filter_games).pack(side=tk.LEFT, padx=5)
+        
+        # Search fields options
+        ttk.Label(options_frame, text="Search in:").pack(side=tk.LEFT, padx=5)
+        self.search_name_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="Name",
+                        variable=self.search_name_var,
+                        command=self._filter_games).pack(side=tk.LEFT, padx=5)
+        self.search_type_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Type",
+                        variable=self.search_type_var,
+                        command=self._filter_games).pack(side=tk.LEFT, padx=5)
+        
+        # Filter frame
+        filter_frame = ttk.Frame(container)
+        filter_frame.grid(row=4, column=0, sticky="ew", pady=(0, 5))
+        
+        self.game_filter_var = tk.StringVar(value="all")
+        ttk.Radiobutton(filter_frame, text="All Games", variable=self.game_filter_var,
+                       value="all", command=self._filter_games).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(filter_frame, text="Enabled Only", variable=self.game_filter_var,
+                       value="enabled", command=self._filter_games).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(filter_frame, text="Disabled Only", variable=self.game_filter_var,
+                       value="disabled", command=self._filter_games).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(filter_frame, text="Incomplete Only", variable=self.game_filter_var,
+                       value="incomplete", command=self._filter_games).pack(side=tk.LEFT, padx=5)
+        
+        # Game list frame
+        list_frame = ttk.Frame(container)
+        list_frame.grid(row=5, column=0, sticky="nsew", pady=5)
+        list_frame.grid_columnconfigure(0, weight=1)
+        list_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create Treeview for games with checkboxes
+        columns = ('enabled', 'name', 'type', 'size', 'status')
+        self.game_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
+        
+        # Define headings with sort functionality
+        self.game_tree.heading('enabled', text='Enabled', command=lambda: self._sort_tree('enabled'))
+        self.game_tree.heading('name', text='Game Name', command=lambda: self._sort_tree('name'))
+        self.game_tree.heading('type', text='Type', command=lambda: self._sort_tree('type'))
+        self.game_tree.heading('size', text='Size', command=lambda: self._sort_tree('size'))
+        self.game_tree.heading('status', text='Status', command=lambda: self._sort_tree('status'))
+        
+        # Define columns
+        self.game_tree.column('enabled', width=60, anchor='center')
+        self.game_tree.column('name', width=300)
+        self.game_tree.column('type', width=100)
+        self.game_tree.column('size', width=100)
+        self.game_tree.column('status', width=200)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.game_tree.yview)
+        self.game_tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Grid the tree and scrollbar
+        self.game_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        
+        # Bind events
+        self.game_tree.bind('<ButtonRelease-1>', self._toggle_game)
+        self.game_tree.bind('<space>', self._toggle_selected_games)  # Space to toggle
+        self.game_tree.bind('<Return>', self._toggle_selected_games)  # Enter to toggle
+        self.game_tree.bind('<Control-a>', self._select_all_games)  # Ctrl+A to select all
+        self.game_tree.bind('<Control-d>', self._deselect_all_games)  # Ctrl+D to deselect all
+        self.game_tree.bind('<Control-e>', lambda e: self._enable_disable_all(True))  # Ctrl+E to enable all
+        self.game_tree.bind('<Control-x>', lambda e: self._enable_disable_all(False))  # Ctrl+X to disable all
+        
+        # Add keyboard shortcut hints to button tooltips
+        self.enable_all_btn = ttk.Button(button_frame, text="Enable All (Ctrl+E)",
+                                       command=lambda: self._enable_disable_all(True))
+        self.enable_all_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.disable_all_btn = ttk.Button(button_frame, text="Disable All (Ctrl+X)",
+                                        command=lambda: self._enable_disable_all(False))
+        self.disable_all_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Add keyboard shortcuts help
+        shortcuts_frame = ttk.LabelFrame(container, text="Keyboard Shortcuts")
+        shortcuts_frame.grid(row=7, column=0, sticky="ew", padx=5, pady=5)
+        
+        shortcuts_text = (
+            "Space/Enter: Toggle selected games\n"
+            "Ctrl+A: Select all games\n"
+            "Ctrl+D: Deselect all games\n"
+            "Ctrl+E: Enable all games\n"
+            "Ctrl+X: Disable all games\n"
+            "↑/↓: Navigate games\n"
+            "Type to search"
+        )
+        ttk.Label(shortcuts_frame, text=shortcuts_text).pack(padx=5, pady=5)
+        
+        # Control buttons frame
+        button_frame = ttk.Frame(container)
+        button_frame.grid(row=6, column=0, sticky="ew", pady=5)
+        
+        ttk.Button(button_frame, text="Enable All",
+                  command=lambda: self._toggle_all_games(True)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Disable All",
+                  command=lambda: self._toggle_all_games(False)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Save Changes",
+                  command=self._save_game_changes).pack(side=tk.RIGHT, padx=5)
+        
+        # Configure tag for hidden items
+        self.game_tree.tag_configure('hidden', background='gray')
+        
+        # Initialize sort state
+        self.sort_column = 'name'  # Default sort column
+        self.sort_reverse = False  # Default sort direction
+        
+        # Load games
+        self._load_games()
+
+    def _toggle_selected_games(self, event=None):
+        """Toggle enabled status of selected games."""
+        selected_items = self.game_tree.selection()
+        if not selected_items:
+            return
+        
+        # Get the current state of the first selected item
+        current_state = self.game_tree.set(selected_items[0], 'enabled')
+        # Toggle to opposite state
+        new_state = "☐" if current_state == "☑" else "☑"
+        
+        # Apply to all selected items
+        for item in selected_items:
+            self.game_tree.set(item, 'enabled', new_state)
+        
+        # Update status count
+        self._update_status_count()
+
+    def _select_all_games(self, event=None):
+        """Select all visible games."""
+        self.game_tree.selection_set(self.game_tree.get_children())
+
+    def _deselect_all_games(self, event=None):
+        """Deselect all games."""
+        self.game_tree.selection_remove(self.game_tree.get_children())
+
+    def _enable_disable_all(self, enable: bool):
+        """Enable or disable all visible games."""
+        for item in self.game_tree.get_children():
+            self.game_tree.set(item, 'enabled', "☑" if enable else "☐")
+        self._update_status_count()
+
+    def _toggle_game(self, event):
+        """Toggle game enabled/disabled status when checkbox is clicked."""
+        region = self.game_tree.identify_region(event.x, event.y)
+        if region == "cell":
+            column = self.game_tree.identify_column(event.x)
+            if column == "#1":  # Enabled column
+                item = self.game_tree.identify_row(event.y)
+                current_value = self.game_tree.set(item, 'enabled')
+                new_value = "☐" if current_value == "☑" else "☑"
+                self.game_tree.set(item, 'enabled', new_value)
+                self._update_status_count()
+
+    def _toggle_all_games(self, enable: bool):
+        """Enable or disable all games in the list."""
+        for item in self.game_tree.get_children():
+            self.game_tree.set(item, 'enabled', "☑" if enable else "☐")
+
+    def _filter_games(self, *args):
+        """Filter games based on search text and filter type."""
+        search_text = self.game_search_var.get().lower().strip()
+        filter_type = self.game_filter_var.get()
+        exact_match = self.exact_match_var.get()
+        
+        # First, reattach all items to make them available for filtering
+        hidden_items = []
+        for item in self.game_tree.get_children():
+            hidden_items.append(item)
+        for item in hidden_items:
+            self.game_tree.reattach(item, '', 'end')
+        
+        # Now filter the items
+        for item in self.game_tree.get_children():
+            game_name = self.game_tree.set(item, 'name').lower()
+            game_type = self.game_tree.set(item, 'type').lower()
+            enabled = self.game_tree.set(item, 'enabled') == "☑"
+            status = self.game_tree.set(item, 'status').lower()
+            
+            # Apply search filter
+            matches_search = True
+            if search_text:  # Only apply search filter if there's search text
+                matches_name = matches_type = False
+                
+                if self.search_name_var.get():
+                    if exact_match:
+                        # Split into words and check if search text matches any complete word
+                        game_words = set(word.strip('()[]{}.,') for word in game_name.split())
+                        matches_name = search_text in game_words
+                    else:
+                        # Partial match anywhere in the name
+                        matches_name = search_text in game_name
+                
+                if self.search_type_var.get():
+                    if exact_match:
+                        matches_type = search_text in game_type.split()
+                    else:
+                        matches_type = search_text in game_type
+                
+                matches_search = (self.search_name_var.get() and matches_name) or \
+                               (self.search_type_var.get() and matches_type)
+            
+            # Apply type filter
+            matches_type = False
+            if filter_type == "all":
+                matches_type = True
+            elif filter_type == "enabled":
+                matches_type = enabled
+            elif filter_type == "disabled":
+                matches_type = not enabled
+            elif filter_type == "incomplete":
+                matches_type = "complete" not in status and "disabled" not in status
+            
+            # Hide items that don't match
+            if not (matches_search and matches_type):
+                self.game_tree.detach(item)
+        
+        # Update status count to reflect filtered items
+        self._update_status_count()
+
+    def _update_status(self, message: str) -> None:
+        """Update the status text with a new message."""
+        def _do_update():
+            try:
+                self.status_text.config(state='normal')
+                timestamp = datetime.now().strftime('%I:%M:%S %p')
+                
+                # Determine message type and apply appropriate tag
+                if any(s in message.lower() for s in ["success", "complete", "saved", "updated", "added"]):
+                    tag = "success"
+                elif any(s in message.lower() for s in ["error", "failed", "invalid", "missing"]):
+                    tag = "error"
+                elif any(s in message.lower() for s in ["warning", "caution", "notice"]):
+                    tag = "warning"
+                else:
+                    tag = ""
+                
+                # Insert timestamp with info color
+                self.status_text.insert(tk.END, f"{timestamp} - ", "info")
+                
+                # Insert message with appropriate color
+                if tag:
+                    self.status_text.insert(tk.END, f"{message}\n", tag)
+                else:
+                    self.status_text.insert(tk.END, f"{message}\n")
+                
+                self.status_text.see(tk.END)
+                self.status_text.config(state='disabled')
+                
+                # Force GUI update
+                self.root.update_idletasks()
+            except Exception as e:
+                print(f"Error updating status: {e}")
+        
+        # If we're in the main thread, update directly
+        if threading.current_thread() is threading.main_thread():
+            _do_update()
+        else:
+            # Otherwise schedule the update
+            self.root.after(0, _do_update)
+
+    def _generate_game_names(self) -> None:
+        """Generate and store sanitized names for all games."""
+        if self.processing:
+            messagebox.showwarning(
+                "Processing in Progress",
+                "A process is already running. Please wait for it to complete."
+            )
+            return
+        
+        # Confirm with user
+        if not messagebox.askyesno("Generate Game Names",
+                                 "This will generate clean, readable names for all games in your library.\n"
+                                 "The process may take a few moments.\n\n"
+                                 "Would you like to proceed?"):
+            return
+        
+        self.processing = True
+        self.start_button.config(state='disabled')
+        self.progress_bar['value'] = 0
+        
+        threading.Thread(target=self._process_generate_names, daemon=True).start()
+
+    def _process_generate_names(self) -> None:
+        """Process the name generation in a separate thread."""
+        try:
+            self.link_manager.generate_game_names(self.progress_queue)
+            
+            # Force a refresh of the game list
+            self.root.after(0, self._load_games)  # Schedule on main thread
+            
+            # Show success message after a short delay to ensure list is refreshed
+            self.root.after(100, lambda: messagebox.showinfo(
+                "Success", 
+                "Game names have been generated successfully!\n\n"
+                "The game list has been refreshed with the new names."
+            ))
+        except Exception as e:
+            self._update_status(f"Error generating game names: {str(e)}")
+            messagebox.showerror("Error", f"Failed to generate game names: {str(e)}")
+        finally:
+            self.processing = False
+            self.start_button.config(state='normal')
+            self.progress_queue.put(("progress", 0)) 
+
+    def _update_status_count(self):
+        """Update the status count display."""
+        # Clear existing status labels
+        for widget in self.status_count_frame.winfo_children():
+            widget.destroy()
+        
+        # Count statuses (only for visible items)
+        total = complete = disabled = in_progress = not_started = 0
+        for item in self.game_tree.get_children():
+            status = self.game_tree.set(item, 'status').lower()
+            total += 1
+            if "complete" in status:
+                complete += 1
+            elif "disabled" in status:
+                disabled += 1
+            elif "not started" in status:
+                not_started += 1
+            else:
+                in_progress += 1
+        
+        # Create status labels with colors
+        status_text = f"Showing: {total}  |  "
+        status_text += f"Complete: {complete}  |  "
+        status_text += f"In Progress: {in_progress}  |  "
+        status_text += f"Not Started: {not_started}  |  "
+        status_text += f"Disabled: {disabled}"
+        
+        ttk.Label(self.status_count_frame, text=status_text).pack(side=tk.LEFT, padx=5)
+
+    def _sort_tree(self, col):
+        """Sort treeview by column."""
+        # Get all items
+        items = [(self.game_tree.set(item, col), item) for item in self.game_tree.get_children()]
+        
+        # If clicking the same column, reverse the sort
+        if self.sort_column == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = col
+            self.sort_reverse = False
+        
+        # Sort items
+        items.sort(reverse=self.sort_reverse)
+        
+        # Special handling for size column
+        if col == 'size':
+            items.sort(key=lambda x: float(x[0].split()[0]) if x[0] != "Unknown" else -1, 
+                      reverse=self.sort_reverse)
+        
+        # Special handling for status column (custom order)
+        elif col == 'status':
+            def status_key(item):
+                status = item[0].lower()
+                if "complete" in status: return 0
+                if "progress" in status: return 1
+                if "not started" in status: return 2
+                if "disabled" in status: return 3
+                return 4
+            items.sort(key=status_key, reverse=self.sort_reverse)
+        
+        # Rearrange items
+        for index, (val, item) in enumerate(items):
+            self.game_tree.move(item, '', index)
+        
+        # Update header arrows
+        for column in ('enabled', 'name', 'type', 'size', 'status'):
+            if column == col:
+                arrow = " ▼" if self.sort_reverse else " ▲"
+            else:
+                arrow = ""
+            self.game_tree.heading(column, text=column.title() + arrow)
+
     def _load_games(self) -> None:
         """Load games from links.json into the treeview."""
         try:
@@ -1050,11 +1763,43 @@ class DownloaderApp:
                 size_str = f"{size_bytes / (1024*1024*1024):.2f} GB" if size_bytes else "Unknown"
                 enabled = game.get('enabled', True)
                 
+                # Determine status
+                status = []
+                if not enabled:
+                    status.append("Disabled")
+                else:
+                    # Check if all steps are complete
+                    if game.get('copied', False):  # If copied is true, it means all previous steps were completed
+                        status.append("Complete")
+                    else:
+                        # Show individual step status
+                        if game.get('downloaded', False):
+                            status.append("Downloaded")
+                        if game.get('extracted', False):
+                            status.append("Extracted")
+                        if not any([game.get('downloaded', False), 
+                                  game.get('extracted', False), 
+                                  game.get('copied', False)]):
+                            status.append("Not Started")
+                
+                status_text = " | ".join(status) if status else "Not Started"
+                
+                # Add color tags based on status
+                if "Complete" in status_text:
+                    status_text = "✓ " + status_text
+                elif "Not Started" in status_text:
+                    status_text = "○ " + status_text
+                elif "Disabled" in status_text:
+                    status_text = "✗ " + status_text
+                else:
+                    status_text = "⟳ " + status_text  # In progress
+                
                 self.game_tree.insert('', tk.END, values=(
                     "☑" if enabled else "☐",  # Checkbox
                     game_name,
                     game_type,
-                    size_str
+                    size_str,
+                    status_text
                 ))
             
             # Sort by name by inserting items in sorted order
@@ -1065,154 +1810,15 @@ class DownloaderApp:
             # Force GUI update
             self.root.update_idletasks()
             
+            # Update status count
+            self._update_status_count()
+            
+            # Apply current filter
+            self._filter_games()
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load games: {str(e)}")
 
-    def _enable_selected(self) -> None:
-        """Enable selected games in the treeview."""
-        selected = self.game_tree.selection()
-        if not selected:
-            messagebox.showinfo("Info", "Please select games to enable")
-            return
-        
-        for item in selected:
-            self.game_tree.set(item, 'enabled', "☑")
-
-    def _disable_selected(self) -> None:
-        """Disable selected games in the treeview."""
-        selected = self.game_tree.selection()
-        if not selected:
-            messagebox.showinfo("Info", "Please select games to disable")
-            return
-        
-        for item in selected:
-            self.game_tree.set(item, 'enabled', "☐")
-
-    def _save_game_changes(self) -> None:
-        """Save game enabled/disabled status to links.json."""
-        try:
-            # Load current links.json
-            with open(self.config.links_file, 'r', encoding='utf-8') as f:
-                links_data = json.load(f)
-            
-            # Update enabled status for each game
-            for item in self.game_tree.get_children():
-                values = self.game_tree.item(item)['values']
-                game_name = values[1]  # Name is now in position 1
-                
-                # Find matching game in links.json
-                for game in links_data:
-                    if os.path.basename(game.get('output_path', '')) == game_name:
-                        game['enabled'] = values[0] == "☑"  # Checkbox is in position 0
-                        break
-            
-            # Save changes
-            with open(self.config.links_file, 'w', encoding='utf-8') as f:
-                json.dump(links_data, f, indent=4)
-            
-            self._update_status("Game status changes saved successfully")
-            messagebox.showinfo("Success", "Game status changes saved")
-            
-        except Exception as e:
-            self._update_status(f"Error saving game changes: {str(e)}")
-            messagebox.showerror("Error", f"Failed to save changes: {str(e)}")
-    
-    def _merge_links_file(self) -> None:
-        """Merge another links.json file with the current one."""
-        if not os.path.exists(self.config.links_file):
-            messagebox.showerror(
-                "Error",
-                "No primary links.json found in the config folder.\n\n"
-                "Please generate a links.json file first."
-            )
-            return
-        
-        # Ask user for the second links.json file
-        second_file = tk.filedialog.askopenfilename(
-            title="Select Second Links File",
-            filetypes=[("JSON files", "*.json")],
-            initialdir=os.path.dirname(self.config.links_file)
-        )
-        
-        if not second_file:
-            return
-        
-        if self.processing:
-            messagebox.showwarning(
-                "Warning",
-                "A process is already running.\n\n"
-                "Please wait for the current process to complete."
-            )
-            return
-        
-        # Switch to main tab and show alert
-        self.notebook.select(0)  # Select the first (main) tab
-        result = messagebox.showinfo(
-            "Merging Files",
-            "Starting merge process...\n\n"
-            "A backup of your current links.json will be created automatically.\n"
-            "Please watch the Status section for progress."
-        )
-        
-        try:
-            # Clear previous status
-            self.status_text.config(state='normal')
-            self.status_text.delete(1.0, tk.END)
-            self.status_text.config(state='disabled')
-            
-            # Reset progress
-            self.progress_bar['value'] = 0
-            self.progress_label.config(text="Progress: 0%")
-            
-            # Update status to show we're starting
-            self._update_status("Starting merge process...")
-            
-            self.processing = True
-            threading.Thread(target=self._process_merge, args=(second_file,), daemon=True).start()
-        except Exception as e:
-            self.processing = False
-            self.logger.log(f"Error starting merge: {e}")
-            self._update_status(f"Error starting merge: {e}")
-            messagebox.showerror("Error", f"Failed to start merge: {e}")
-    
-    def _process_merge(self, second_file: str) -> None:
-        """Process the merge in a separate thread."""
-        try:
-            self.link_manager.merge_links_files(second_file, self.progress_queue)
-            
-            # Recalculate sizes after merge
-            self._update_status("Recalculating library sizes...")
-            self.config.calculate_library_sizes()
-            
-            # Force GUI update
-            self.root.after(0, lambda: [
-                self._update_size_info(),
-                self._update_status("Merge complete!")
-            ])
-            
-            # Show completion message
-            self.root.after(100, lambda: 
-                messagebox.showinfo("Success", "Links files have been merged successfully!"))
-        except Exception as e:
-            self.logger.log(f"Error during merge: {e}")
-            self._update_status(f"Error during merge: {e}")
-            messagebox.showerror(
-                "Error",
-                f"An error occurred during merge:\n{str(e)}\n\n"
-                "Your original links.json has been preserved in the .bak file."
-            )
-        finally:
-            self.processing = False
-            self.progress_queue.put(("progress", 0))
-            self.progress_label.config(text="Progress: 0%")
-    
-    def _browse_hdd(self) -> None:
-        """Browse for Xbox HDD directory."""
-        directory = tk.filedialog.askdirectory(title="Select Xbox HDD Directory")
-        if directory:
-            self.hdd_entry.delete(0, tk.END)
-            self.hdd_entry.insert(0, directory)
-    
     def _start_hdd_import(self) -> None:
         """Start the HDD import process."""
         if self.processing:
@@ -1342,175 +1948,220 @@ class DownloaderApp:
             self._update_status(f"Error resetting import status: {str(e)}")
             messagebox.showerror("Error", f"Reset failed: {str(e)}")
 
-    def _setup_games_tab(self, parent):
-        """Setup the games management tab."""
-        # Main container with padding
-        container = ttk.Frame(parent)
-        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        container.grid_columnconfigure(0, weight=1)
-        container.grid_rowconfigure(1, weight=1)
-        
-        # Header with description
-        header_frame = ttk.Frame(container)
-        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        
-        ttk.Label(header_frame, text="Game Management", style="Header.TLabel").pack(anchor="w")
-        desc_text = ("Enable or disable games in your library.\n"
-                    "Disabled games will be skipped during processing.")
-        ttk.Label(header_frame, text=desc_text, wraplength=600).pack(anchor="w", pady=5)
-        
-        # Control buttons frame
-        button_frame = ttk.Frame(container)
-        button_frame.grid(row=1, column=0, sticky="ew", pady=(0, 5))
-        
-        # Add generate names button
-        ttk.Button(button_frame, text="Generate Game Names",
-                  command=self._generate_game_names).pack(side=tk.LEFT, padx=5)
-        
-        # Search and filter frame
-        search_frame = ttk.Frame(container)
-        search_frame.grid(row=2, column=0, sticky="ew", pady=(0, 5))
-        
-        ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=5)
-        self.game_search_var = tk.StringVar()
-        self.game_search_var.trace_add("write", self._filter_games)
-        search_entry = ttk.Entry(search_frame, textvariable=self.game_search_var, width=30)
-        search_entry.pack(side=tk.LEFT, padx=5)
-        
-        # Filter frame
-        filter_frame = ttk.Frame(container)
-        filter_frame.grid(row=3, column=0, sticky="ew", pady=(0, 5))
-        
-        self.game_filter_var = tk.StringVar(value="all")
-        ttk.Radiobutton(filter_frame, text="All Games", variable=self.game_filter_var,
-                       value="all", command=self._filter_games).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(filter_frame, text="Enabled Only", variable=self.game_filter_var,
-                       value="enabled", command=self._filter_games).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(filter_frame, text="Disabled Only", variable=self.game_filter_var,
-                       value="disabled", command=self._filter_games).pack(side=tk.LEFT, padx=5)
-        
-        # Game list frame
-        list_frame = ttk.Frame(container)
-        list_frame.grid(row=4, column=0, sticky="nsew", pady=5)
-        list_frame.grid_columnconfigure(0, weight=1)
-        list_frame.grid_rowconfigure(0, weight=1)
-        
-        # Create Treeview for games with checkboxes
-        columns = ('enabled', 'name', 'type', 'size')
-        self.game_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
-        
-        # Define headings
-        self.game_tree.heading('enabled', text='')
-        self.game_tree.heading('name', text='Game Name')
-        self.game_tree.heading('type', text='Type')
-        self.game_tree.heading('size', text='Size')
-        
-        # Define columns
-        self.game_tree.column('enabled', width=30, anchor='center')
-        self.game_tree.column('name', width=300)
-        self.game_tree.column('type', width=100)
-        self.game_tree.column('size', width=100)
-        
-        # Add scrollbar
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.game_tree.yview)
-        self.game_tree.configure(yscrollcommand=scrollbar.set)
-        
-        # Grid the tree and scrollbar
-        self.game_tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        
-        # Bind checkbox click
-        self.game_tree.bind('<ButtonRelease-1>', self._toggle_game)
-        
-        # Control buttons frame
-        button_frame = ttk.Frame(container)
-        button_frame.grid(row=5, column=0, sticky="ew", pady=5)
-        
-        ttk.Button(button_frame, text="Enable All",
-                  command=lambda: self._toggle_all_games(True)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Disable All",
-                  command=lambda: self._toggle_all_games(False)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Save Changes",
-                  command=self._save_game_changes).pack(side=tk.RIGHT, padx=5)
-        
-        # Load games
-        self._load_games()
-
-    def _toggle_game(self, event):
-        """Toggle game enabled/disabled status when checkbox is clicked."""
-        region = self.game_tree.identify_region(event.x, event.y)
-        if region == "cell":
-            column = self.game_tree.identify_column(event.x)
-            if column == "#1":  # Enabled column
-                item = self.game_tree.identify_row(event.y)
-                current_value = self.game_tree.set(item, 'enabled')
-                new_value = "☐" if current_value == "☑" else "☑"
-                self.game_tree.set(item, 'enabled', new_value)
-
-    def _toggle_all_games(self, enable: bool):
-        """Enable or disable all games in the list."""
-        for item in self.game_tree.get_children():
-            self.game_tree.set(item, 'enabled', "☑" if enable else "☐")
-
-    def _filter_games(self, *args):
-        """Filter games based on search text and filter type."""
-        search_text = self.game_search_var.get().lower()
-        filter_type = self.game_filter_var.get()
-        
-        for item in self.game_tree.get_children():
-            game_name = self.game_tree.set(item, 'name').lower()
-            enabled = self.game_tree.set(item, 'enabled') == "☑"
+    def _save_game_changes(self) -> None:
+        """Save game enabled/disabled status to links.json."""
+        try:
+            # Load current links.json
+            with open(self.config.links_file, 'r', encoding='utf-8') as f:
+                links_data = json.load(f)
             
-            # Apply search filter
-            matches_search = search_text in game_name
+            # Update enabled status for each game
+            for item in self.game_tree.get_children():
+                values = self.game_tree.item(item)['values']
+                game_name = values[1]  # Name is now in position 1
+                
+                # Find matching game in links.json
+                for game in links_data:
+                    if os.path.basename(game.get('output_path', '')) == game_name:
+                        game['enabled'] = values[0] == "☑"  # Checkbox is in position 0
+                        break
             
-            # Apply type filter
-            matches_type = (
-                filter_type == "all" or
-                (filter_type == "enabled" and enabled) or
-                (filter_type == "disabled" and not enabled)
+            # Save changes
+            with open(self.config.links_file, 'w', encoding='utf-8') as f:
+                json.dump(links_data, f, indent=4)
+            
+            self._update_status("Game status changes saved successfully")
+            messagebox.showinfo("Success", "Game status changes saved")
+            
+        except Exception as e:
+            self._update_status(f"Error saving game changes: {str(e)}")
+            messagebox.showerror("Error", f"Failed to save changes: {str(e)}")
+    
+    def _merge_links_file(self) -> None:
+        """Merge another links.json file with the current one."""
+        if not os.path.exists(self.config.links_file):
+            messagebox.showerror(
+                "Error",
+                "No primary links.json found in the config folder.\n\n"
+                "Please generate a links.json file first."
             )
-            
-            # Show/hide based on filters
-            if matches_search and matches_type:
-                self.game_tree.item(item, open=True)
-            else:
-                self.game_tree.item(item, open=False)
-
-    def _update_status(self, message: str) -> None:
-        """Update the status text with a new message."""
-        def _do_update():
-            self.status_text.config(state='normal')
-            timestamp = datetime.now().strftime('%I:%M:%S %p')
-            
-            # Determine message type and apply appropriate tag
-            if any(s in message.lower() for s in ["success", "complete", "saved", "updated", "added"]):
-                tag = "success"
-            elif any(s in message.lower() for s in ["error", "failed", "invalid", "missing"]):
-                tag = "error"
-            elif any(s in message.lower() for s in ["warning", "caution", "notice"]):
-                tag = "warning"
-            else:
-                tag = ""
-            
-            # Insert timestamp with info color
-            self.status_text.insert(tk.END, f"{timestamp} - ", "info")
-            
-            # Insert message with appropriate color
-            if tag:
-                self.status_text.insert(tk.END, f"{message}\n", tag)
-            else:
-                self.status_text.insert(tk.END, f"{message}\n")
-            
-            self.status_text.see(tk.END)
-            self.status_text.config(state='disabled')
+            return
         
-        # If we're in the main thread, update directly
-        if threading.current_thread() is threading.main_thread():
-            _do_update()
-        else:
-            # Otherwise schedule the update
-            self.root.after(0, _do_update)
+        # Ask user for the second links.json file
+        second_file = tk.filedialog.askopenfilename(
+            title="Select Second Links File",
+            filetypes=[("JSON files", "*.json")],
+            initialdir=os.path.dirname(self.config.links_file)
+        )
+        
+        if not second_file:
+            return
+        
+        if self.processing:
+            messagebox.showwarning(
+                "Warning",
+                "A process is already running.\n\n"
+                "Please wait for the current process to complete."
+            )
+            return
+        
+        # Switch to main tab and show alert
+        self.notebook.select(0)  # Select the first (main) tab
+        result = messagebox.showinfo(
+            "Merging Files",
+            "Starting merge process...\n\n"
+            "A backup of your current links.json will be created automatically.\n"
+            "Please watch the Status section for progress."
+        )
+        
+        try:
+            # Clear previous status
+            self.status_text.config(state='normal')
+            self.status_text.delete(1.0, tk.END)
+            self.status_text.config(state='disabled')
+            
+            # Reset progress
+            self.progress_bar['value'] = 0
+            self.progress_label.config(text="Progress: 0%")
+            
+            # Update status to show we're starting
+            self._update_status("Starting merge process...")
+            
+            self.processing = True
+            threading.Thread(target=self._process_merge, args=(second_file,), daemon=True).start()
+        except Exception as e:
+            self.processing = False
+            self.logger.log(f"Error starting merge: {e}")
+            self._update_status(f"Error starting merge: {e}")
+            messagebox.showerror("Error", f"Failed to start merge: {e}")
+    
+    def _process_merge(self, second_file: str) -> None:
+        """Process the merge in a separate thread."""
+        try:
+            self.link_manager.merge_links_files(second_file, self.progress_queue)
+            
+            # Recalculate sizes after merge
+            self._update_status("Recalculating library sizes...")
+            self.config.calculate_library_sizes()
+            
+            # Force GUI update
+            self.root.after(0, lambda: [
+                self._update_size_info(),
+                self._update_status("Merge complete!")
+            ])
+            
+            # Show completion message
+            self.root.after(100, lambda: 
+                messagebox.showinfo("Success", "Links files have been merged successfully!"))
+        except Exception as e:
+            self.logger.log(f"Error during merge: {e}")
+            self._update_status(f"Error during merge: {e}")
+            messagebox.showerror(
+                "Error",
+                f"An error occurred during merge:\n{str(e)}\n\n"
+                "Your original links.json has been preserved in the .bak file."
+            )
+        finally:
+            self.processing = False
+            self.progress_queue.put(("progress", 0))
+            self.progress_label.config(text="Progress: 0%")
+    
+    def _browse_hdd(self) -> None:
+        """Browse for Xbox HDD directory."""
+        directory = tk.filedialog.askdirectory(title="Select Xbox HDD Directory")
+        if directory:
+            self.hdd_entry.delete(0, tk.END)
+            self.hdd_entry.insert(0, directory)
+    
+    def _process_hdd_import(self, hdd_dir: str, timeout: int) -> None:
+        """Process the HDD import in a separate thread."""
+        try:
+            # Load links.json
+            with open(self.config.links_file, 'r', encoding='utf-8') as f:
+                links_data = json.load(f)
+            
+            # Filter for unimported games
+            games_to_import = [link for link in links_data 
+                             if not link.get('imported', False)]
+            
+            total_games = len(games_to_import)
+            if total_games == 0:
+                self._update_status("No games to import - all games are already marked as imported")
+                return
+            
+            self._update_status(f"Starting import of {total_games} games...")
+            
+            for i, game in enumerate(games_to_import, 1):
+                game_name = os.path.basename(game.get('output_path', ''))
+                self._update_status(f"Importing {game_name} ({i}/{total_games})")
+                
+                # Calculate progress
+                progress = (i / total_games) * 100
+                self.progress_queue.put(("progress", progress))
+                
+                # Copy game to HDD
+                source_path = os.path.join(self.config.output_dir, game_name)
+                if not os.path.exists(source_path):
+                    self._update_status(f"Warning: {game_name} not found in output directory")
+                    continue
+                
+                dest_path = os.path.join(hdd_dir, game_name)
+                try:
+                    # Use shutil.copy2 to preserve metadata
+                    shutil.copy2(source_path, dest_path)
+                    
+                    # Update links.json
+                    game['imported'] = True
+                    game['import_date'] = datetime.now().isoformat()
+                    game['hdd_path'] = dest_path
+                    
+                    with open(self.config.links_file, 'w', encoding='utf-8') as f:
+                        json.dump(links_data, f, indent=4)
+                    
+                    self._update_status(f"Successfully imported {game_name}")
+                except Exception as e:
+                    self._update_status(f"Error importing {game_name}: {str(e)}")
+                    continue
+            
+            self._update_status("Import process completed")
+            messagebox.showinfo("Success", "HDD import process completed")
+            
+        except Exception as e:
+            self._update_status(f"Error during HDD import: {str(e)}")
+            messagebox.showerror("Error", f"Import failed: {str(e)}")
+        finally:
+            self.processing = False
+            self.start_button.config(state='normal')
+            self.progress_queue.put(("progress", 0))
+    
+    def _reset_import_status(self) -> None:
+        """Reset the import status for all games in links.json."""
+        if not messagebox.askyesno("Confirm Reset",
+                                 "This will mark all games as not imported in links.json.\n"
+                                 "This action cannot be undone.\n\n"
+                                 "Would you like to proceed?"):
+            return
+        
+        try:
+            with open(self.config.links_file, 'r', encoding='utf-8') as f:
+                links_data = json.load(f)
+            
+            for game in links_data:
+                game['imported'] = False
+                if 'import_date' in game:
+                    del game['import_date']
+                if 'hdd_path' in game:
+                    del game['hdd_path']
+            
+            with open(self.config.links_file, 'w', encoding='utf-8') as f:
+                json.dump(links_data, f, indent=4)
+            
+            self._update_status("Import status has been reset for all games")
+            messagebox.showinfo("Success", "Import status has been reset")
+            
+        except Exception as e:
+            self._update_status(f"Error resetting import status: {str(e)}")
+            messagebox.showerror("Error", f"Reset failed: {str(e)}")
 
     def _generate_game_names(self) -> None:
         """Generate and store sanitized names for all games."""
@@ -1555,3 +2206,296 @@ class DownloaderApp:
             self.processing = False
             self.start_button.config(state='normal')
             self.progress_queue.put(("progress", 0)) 
+
+    def _setup_iso2god_tab(self, parent):
+        """Set up the ISO2GOD conversion tab"""
+        # Main container
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill="both", expand=True)
+        
+        # Header
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill="x", pady=(0, 10))
+        
+        ttk.Label(
+            header_frame,
+            text="ISO to GOD Conversion",
+            font=("Arial", 12, "bold")
+        ).pack(side="left")
+        
+        # Settings frame
+        settings_frame = ttk.LabelFrame(main_frame, text="Conversion Settings", padding="10")
+        settings_frame.pack(fill="x", pady=(0, 10))
+        
+        # Input directory
+        input_frame = ttk.Frame(settings_frame)
+        input_frame.pack(fill="x", pady=(0, 5))
+        
+        ttk.Label(input_frame, text="ISO Directory:").pack(side="left")
+        self.iso_dir_var = tk.StringVar(value=getattr(self.config, 'iso_dir', ''))
+        ttk.Entry(input_frame, textvariable=self.iso_dir_var, width=50).pack(side="left", padx=5)
+        ttk.Button(
+            input_frame,
+            text="Browse",
+            command=lambda: self._browse_iso_dir()
+        ).pack(side="left")
+        
+        # Output directory
+        output_frame = ttk.Frame(settings_frame)
+        output_frame.pack(fill="x", pady=(0, 5))
+        
+        ttk.Label(output_frame, text="GOD Output:").pack(side="left")
+        self.god_dir_var = tk.StringVar(value=getattr(self.config, 'god_dir', ''))
+        ttk.Entry(output_frame, textvariable=self.god_dir_var, width=50).pack(side="left", padx=5)
+        ttk.Button(
+            output_frame,
+            text="Browse",
+            command=lambda: self._browse_god_dir()
+        ).pack(side="left")
+        
+        # Conversion options
+        options_frame = ttk.Frame(settings_frame)
+        options_frame.pack(fill="x", pady=(0, 5))
+        
+        # Thread count
+        thread_frame = ttk.Frame(options_frame)
+        thread_frame.pack(side="left", padx=10)
+        ttk.Label(thread_frame, text="Threads:").pack(side="left")
+        self.thread_count_var = tk.StringVar(value="4")
+        ttk.Spinbox(
+            thread_frame,
+            from_=1,
+            to=8,
+            textvariable=self.thread_count_var,
+            width=5
+        ).pack(side="left", padx=5)
+        
+        # Trim option
+        self.trim_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            options_frame,
+            text="Trim ISO",
+            variable=self.trim_var
+        ).pack(side="left", padx=10)
+        
+        # Control buttons
+        control_frame = ttk.Frame(main_frame)
+        control_frame.pack(fill="x", pady=(0, 10))
+        
+        ttk.Button(
+            control_frame,
+            text="Start Conversion",
+            command=self._start_conversion
+        ).pack(side="left", padx=5)
+        
+        ttk.Button(
+            control_frame,
+            text="Stop",
+            command=self._stop_conversion
+        ).pack(side="left", padx=5)
+        
+        # Progress frame
+        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding="10")
+        progress_frame.pack(fill="both", expand=True)
+        
+        # Progress bar
+        self.conversion_progress = ttk.Progressbar(
+            progress_frame,
+            orient="horizontal",
+            length=100,
+            mode="determinate"
+        )
+        self.conversion_progress.pack(fill="x", pady=(0, 5))
+        
+        # Status text
+        self.conversion_status = ttk.Label(progress_frame, text="Ready")
+        self.conversion_status.pack(fill="x")
+        
+        # Game list
+        list_frame = ttk.Frame(progress_frame)
+        list_frame.pack(fill="both", expand=True, pady=(5, 0))
+        
+        # Create treeview
+        columns = ("game", "status", "size")
+        self.conversion_tree = ttk.Treeview(
+            list_frame,
+            columns=columns,
+            show="headings"
+        )
+        
+        # Define headings
+        self.conversion_tree.heading("game", text="Game")
+        self.conversion_tree.heading("status", text="Status")
+        self.conversion_tree.heading("size", text="Size")
+        
+        # Define columns
+        self.conversion_tree.column("game", width=300)
+        self.conversion_tree.column("status", width=100)
+        self.conversion_tree.column("size", width=100)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self.conversion_tree.yview
+        )
+        self.conversion_tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack tree and scrollbar
+        self.conversion_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+    def _browse_iso_dir(self):
+        """Browse for ISO directory."""
+        directory = filedialog.askdirectory(title="Select ISO Directory")
+        if directory:
+            self.iso_dir_var.set(directory)
+            setattr(self.config, 'iso_dir', directory)
+            self.config.save()
+
+    def _browse_god_dir(self):
+        """Browse for GOD output directory."""
+        directory = filedialog.askdirectory(title="Select GOD Output Directory")
+        if directory:
+            self.god_dir_var.set(directory)
+            setattr(self.config, 'god_dir', directory)
+            self.config.save()
+
+    def _start_conversion(self):
+        """Start the ISO to GOD conversion process."""
+        if self.processing:
+            messagebox.showwarning(
+                "Processing in Progress",
+                "A process is already running. Please wait for it to complete."
+            )
+            return
+
+        # Validate directories
+        iso_dir = self.iso_dir_var.get()
+        god_dir = self.god_dir_var.get()
+        
+        if not iso_dir or not god_dir:
+            messagebox.showerror(
+                "Error",
+                "Please select both input and output directories"
+            )
+            return
+        
+        # Get conversion settings
+        try:
+            num_threads = int(self.thread_count_var.get())
+            if num_threads < 1 or num_threads > 8:
+                raise ValueError("Thread count must be between 1 and 8")
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            return
+        
+        trim = self.trim_var.get()
+        
+        # Create directories if they don't exist
+        try:
+            os.makedirs(iso_dir, exist_ok=True)
+            os.makedirs(god_dir, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create directories: {e}")
+            return
+        
+        # Start conversion in a separate thread
+        self.processing = True
+        self.progress_queue.put(("progress", 0))
+        threading.Thread(
+            target=self._run_conversion,
+            args=(iso_dir, god_dir, num_threads, trim),
+            daemon=True
+        ).start()
+
+    def _stop_conversion(self):
+        """Stop the conversion process."""
+        if hasattr(self, 'converter'):
+            self.converter.stop()
+            self._update_status("Conversion stopped")
+            self.processing = False
+
+    def _run_conversion(self, iso_dir: str, god_dir: str, num_threads: int, trim: bool):
+        """Run the conversion process in a separate thread."""
+        try:
+            # Create converter instance
+            self.converter = ISO2GODConverter()
+            
+            # Update status
+            self._update_status("Starting conversion process...")
+            
+            # Get list of ISO files
+            iso_files = [f for f in os.listdir(iso_dir) if f.lower().endswith('.iso')]
+            if not iso_files:
+                self._update_status("No ISO files found in directory")
+                messagebox.showinfo("Complete", "No ISO files found to convert")
+                return
+            
+            # Clear existing items in tree
+            for item in self.conversion_tree.get_children():
+                self.conversion_tree.delete(item)
+            
+            # Add files to tree
+            for iso_file in iso_files:
+                self.conversion_tree.insert('', 'end', values=(
+                    iso_file,
+                    "Pending",
+                    f"{os.path.getsize(os.path.join(iso_dir, iso_file)) / (1024*1024*1024):.2f} GB"
+                ))
+            
+            # Process each ISO file
+            total_files = len(iso_files)
+            for i, iso_file in enumerate(iso_files, 1):
+                if not self.processing:  # Check if we should stop
+                    break
+                
+                iso_path = os.path.join(iso_dir, iso_file)
+                game_output_dir = os.path.join(god_dir, os.path.splitext(iso_file)[0])
+                
+                # Update tree status
+                for item in self.conversion_tree.get_children():
+                    if self.conversion_tree.item(item)['values'][0] == iso_file:
+                        self.conversion_tree.item(item, values=(
+                            iso_file,
+                            "Converting...",
+                            self.conversion_tree.item(item)['values'][2]
+                        ))
+                        break
+                
+                # Convert the ISO
+                success = self.converter.convert_iso(
+                    iso_path=iso_path,
+                    output_dir=game_output_dir,
+                    progress_queue=self.progress_queue,
+                    num_threads=num_threads,
+                    trim=trim
+                )
+                
+                # Update status in tree
+                status = "Complete" if success else "Failed"
+                for item in self.conversion_tree.get_children():
+                    if self.conversion_tree.item(item)['values'][0] == iso_file:
+                        self.conversion_tree.item(item, values=(
+                            iso_file,
+                            status,
+                            self.conversion_tree.item(item)['values'][2]
+                        ))
+                        break
+                
+                # Update overall progress
+                progress = (i / total_files) * 100
+                self.conversion_progress['value'] = progress
+                self.conversion_status.config(text=f"Converting: {progress:.1f}%")
+            
+            if self.processing:  # If we didn't stop early
+                self._update_status("Conversion complete!")
+                messagebox.showinfo("Complete", "All ISO files have been converted")
+            
+        except Exception as e:
+            self._update_status(f"Error during conversion: {str(e)}")
+            messagebox.showerror("Error", f"Conversion failed: {str(e)}")
+        finally:
+            self.processing = False
+            self.conversion_progress['value'] = 0
+            self.conversion_status.config(text="Ready")

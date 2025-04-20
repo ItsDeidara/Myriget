@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from queue import Queue
 import shutil
+import time
 
 class LinkManager:
     """Manages link processing and JSON operations."""
@@ -17,6 +18,7 @@ class LinkManager:
         self.links_file = os.path.join(
             os.path.dirname(__file__), "..", "config", "links.json"
         )
+        self.last_status_time = 0  # Track last status update time
     
     def set_links_file(self, links_file: str) -> None:
         """Set the links file path."""
@@ -57,96 +59,286 @@ class LinkManager:
             # If anything goes wrong, return a basic sanitized version
             return os.path.splitext(os.path.basename(url))[0].replace('_', ' ').replace('-', ' ')
     
+    def _should_update_status(self, message: str = "") -> bool:
+        """Check if status should be updated based on message type and timing.
+        
+        Args:
+            message: The status message to check
+        
+        Returns:
+            bool: True if status should be updated
+        """
+        # Always show important messages immediately
+        lower_msg = message.lower()
+        if any(s in lower_msg for s in [
+            "error", "failed", "invalid", "missing",  # Errors
+            "success", "complete", "saved", "finished",  # Success
+            "warning", "caution", "critical"  # Warnings
+        ]):
+            return True
+        
+        # Rate limit regular status updates
+        current_time = time.time()
+        if current_time - self.last_status_time >= 10:  # 10 seconds between regular updates
+            self.last_status_time = current_time
+            return True
+        return False
+    
     def process_links(self, links_file: str, temp_dir: str, temp_extract_dir: str,
                      output_dir: str, batch_size: int, progress_queue: Queue,
                      filter_type: str = "All") -> None:
         """Process links from the specified file."""
         try:
-            # Load links
+            # Important messages - show immediately
+            progress_queue.put(("status", "Loading links from file..."))
             with open(links_file, 'r', encoding='utf-8') as f:
                 links_data = json.load(f)
             
+            # Validate URLs in JSON
+            invalid_urls = []
+            for link in links_data:
+                url = link.get('url', '')
+                if not url.endswith('.zip'):
+                    invalid_urls.append(url)
+            
+            if invalid_urls:
+                error_msg = "Error: Found invalid URLs in links.json (will be skipped):\n" + "\n".join(invalid_urls)
+                progress_queue.put(("status", error_msg))
+                # Don't raise error, just skip invalid URLs
+                links_data = [link for link in links_data if link.get('url', '').endswith('.zip')]
+            
             # Filter links based on type
+            total_before_filter = len(links_data)
             if filter_type == "Incomplete":
-                links_data = [link for link in links_data if not link.get('processed', False)]
+                links_data = [link for link in links_data if not (
+                    link.get('downloaded', False) and 
+                    link.get('extracted', False) and 
+                    link.get('copied', False)
+                )]
+                progress_queue.put(("status", "\033[38;5;208mBefore filtering: {total_before_filter} links\033[0m".format(total_before_filter=total_before_filter)))
+                progress_queue.put(("status", "\033[38;5;208mAfter filtering for incomplete: {filtered} links\033[0m".format(filtered=len(links_data))))
+                
+                # Debug counts for each state
+                downloaded_count = sum(1 for link in links_data if link.get('downloaded', False))
+                extracted_count = sum(1 for link in links_data if link.get('extracted', False))
+                copied_count = sum(1 for link in links_data if link.get('copied', False))
+                progress_queue.put(("status", "\033[38;5;208mState counts in filtered links:\033[0m"))
+                progress_queue.put(("status", "\033[38;5;208m- Downloaded: {downloaded_count}\033[0m".format(downloaded_count=downloaded_count)))
+                progress_queue.put(("status", "\033[38;5;208m- Extracted: {extracted_count}\033[0m".format(extracted_count=extracted_count)))
+                progress_queue.put(("status", "\033[38;5;208m- Copied: {copied_count}\033[0m".format(copied_count=copied_count)))
+                
             elif filter_type == "Enabled":
                 links_data = [link for link in links_data if link.get('enabled', True)]
+                progress_queue.put(("status", "\033[38;5;208mAfter filtering for enabled: {filtered} links\033[0m".format(filtered=len(links_data))))
+            
+            # Count total links to process
+            total_links = len(links_data)
+            progress_queue.put(("status", f"Found {total_links} links to process"))
+            
+            if total_links == 0:
+                progress_queue.put(("status", "No links to process"))
+                return
             
             # Process in batches
-            total_links = len(links_data)
+            processed_count = 0
+            total_batches = (total_links + batch_size - 1) // batch_size  # Calculate total number of batches
             for i in range(0, total_links, batch_size):
                 batch = links_data[i:i + batch_size]
-                self._process_batch(batch, temp_dir, temp_extract_dir, output_dir, progress_queue)
+                batch_size_actual = len(batch)
+                current_batch = (i // batch_size) + 1
+                status_msg = f"\033[38;5;208mProcessing batch {current_batch} of {total_batches} ({batch_size_actual} links)...\033[0m"
+                progress_queue.put(("status", status_msg))
                 
-                # Update progress
-                progress = min(100, (i + len(batch)) / total_links * 100)
-                progress_queue.put(("progress", progress))
+                # Process each link in the batch
+                for j, link in enumerate(batch):
+                    try:
+                        # Skip disabled games
+                        if not link.get('enabled', True):
+                            status_msg = f"Skipping disabled game: {link.get('name', 'Unknown')}"
+                            if self._should_update_status(status_msg):
+                                progress_queue.put(("status", status_msg))
+                            continue
+                        
+                        # Get game name
+                        game_name = link.get('name', os.path.basename(link['url']))
+                        status_msg = f"Processing {game_name} ({processed_count + 1}/{total_links})"
+                        if self._should_update_status(status_msg):
+                            progress_queue.put(("status", status_msg))
+                        
+                        # Download file
+                        file_path = self._download_file(link['url'], temp_dir, progress_queue)
+                        if not file_path:
+                            continue
+                        
+                        # Extract if needed
+                        extract_dir = os.path.join(temp_extract_dir, os.path.basename(file_path))
+                        if self._extract_file(file_path, extract_dir, progress_queue):
+                            # Copy to output
+                            if self._copy_to_output(extract_dir, output_dir, progress_queue):
+                                # Update link status
+                                link['downloaded'] = True
+                                link['extracted'] = True
+                                link['copied'] = True
+                                link['processed'] = True
+                                link['output_path'] = os.path.join(output_dir, game_name)
+                                
+                                # Save progress after each successful game
+                                with open(links_file, 'w', encoding='utf-8') as f:
+                                    json.dump(links_data, f, indent=4)
+                                
+                                # Show success immediately
+                                progress_queue.put(("status", f"Successfully processed: {game_name}"))
+                        
+                        # Cleanup
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                            status_msg = f"Cleaned up download: {game_name}"
+                            if self._should_update_status(status_msg):
+                                progress_queue.put(("status", status_msg))
+                        if os.path.exists(extract_dir):
+                            shutil.rmtree(extract_dir)
+                            status_msg = f"Cleaned up extraction: {game_name}"
+                            if self._should_update_status(status_msg):
+                                progress_queue.put(("status", status_msg))
+                        
+                        processed_count += 1
+                        # Update progress
+                        progress = (processed_count / total_links) * 100
+                        progress_queue.put(("progress", progress))
+                        
+                    except Exception as e:
+                        # Show errors immediately
+                        error_msg = f"Error processing {link.get('name', 'Unknown')}: {str(e)}"
+                        progress_queue.put(("status", error_msg))
+                        continue
                 
-                # Update processing log
-                self._update_processing_log(links_file, batch)
-        
+                # Save progress after each batch
+                status_msg = f"\033[38;5;208mCompleted batch {current_batch} of {total_batches}. Progress: {(processed_count / total_links) * 100:.1f}%\033[0m"
+                progress_queue.put(("status", status_msg))
+                with open(links_file, 'w', encoding='utf-8') as f:
+                    json.dump(links_data, f, indent=4)
+            
+            # Show completion immediately
+            progress_queue.put(("status", f"Processing complete! Processed {processed_count} of {total_links} links."))
+            
         except Exception as e:
-            progress_queue.put(("status", f"Error processing links: {str(e)}"))
+            # Show errors immediately
+            error_msg = f"Error processing links: {str(e)}"
+            progress_queue.put(("status", error_msg))
             raise
     
-    def _process_batch(self, batch: List[Dict], temp_dir: str, temp_extract_dir: str,
-                      output_dir: str, progress_queue: Queue) -> None:
-        """Process a batch of links."""
-        for link in batch:
-            try:
-                url = link.get('url')
-                if not url:
-                    continue
-                
-                # Generate sanitized name if not already present
-                if 'name' not in link:
-                    link['name'] = self._sanitize_game_name(url)
-                
-                # Download file
-                file_path = self._download_file(url, temp_dir, progress_queue)
-                if not file_path:
-                    continue
-                
-                # Extract if needed
-                extract_dir = os.path.join(temp_extract_dir, os.path.basename(file_path))
-                if self._extract_file(file_path, extract_dir, progress_queue):
-                    # Copy to output
-                    self._copy_to_output(extract_dir, output_dir, progress_queue)
-                    
-                    # Update link status
-                    link['processed'] = True
-                    link['output_path'] = os.path.join(output_dir, link['name'])
-                
-                # Cleanup
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                if os.path.exists(extract_dir):
-                    shutil.rmtree(extract_dir)
+    def _validate_download(self, file_path: str, expected_url: str, progress_queue: Queue) -> bool:
+        """Validate that the downloaded file matches what we expect.
+        
+        Args:
+            file_path: Path to the downloaded file
+            expected_url: The URL from the JSON that we downloaded
+            progress_queue: Queue for progress updates
+        
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        try:
+            # Get expected filename from URL
+            expected_filename = os.path.basename(expected_url)
+            actual_filename = os.path.basename(file_path)
             
-            except Exception as e:
-                progress_queue.put(("status", f"Error processing {url}: {str(e)}"))
-                continue
+            # Check if filenames match
+            if expected_filename != actual_filename:
+                progress_queue.put(("status", f"Error: Downloaded file '{actual_filename}' does not match expected '{expected_filename}'. Skipping for now."))
+                return False
+            
+            # Check if file exists and has size
+            if not os.path.exists(file_path):
+                progress_queue.put(("status", f"Error: Downloaded file '{file_path}' does not exist. Will retry later."))
+                return False
+            
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                progress_queue.put(("status", f"Error: Downloaded file '{file_path}' is empty. Will retry later."))
+                return False
+            
+            # Check if it's a valid zip file
+            if not self._is_valid_zip(file_path):
+                progress_queue.put(("status", f"Error: File '{file_path}' is not a valid zip file. Will retry later."))
+                return False
+            
+            return True
+        
+        except Exception as e:
+            progress_queue.put(("status", f"Error validating download: {str(e)}. Will retry later."))
+            return False
     
-    def _download_file(self, url: str, temp_dir: str,
-                      progress_queue: Queue) -> Optional[str]:
+    def _is_valid_zip(self, file_path: str) -> bool:
+        """Check if a file is a valid zip file.
+        
+        Args:
+            file_path: Path to the file to check
+        
+        Returns:
+            bool: True if valid zip file, False otherwise
+        """
+        try:
+            import zipfile
+            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                # Try to read the zip contents
+                zip_ref.testzip()
+            return True
+        except zipfile.BadZipFile:
+            return False
+        except Exception:
+            return False
+    
+    def _download_file(self, url: str, temp_dir: str, progress_queue: Queue) -> Optional[str]:
         """Download a file from URL."""
         try:
-            response = requests.get(url, stream=True)
+            status_msg = f"Downloading: {os.path.basename(url)}"
+            if self._should_update_status(status_msg):
+                progress_queue.put(("status", status_msg))
+            
+            response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
             
             filename = os.path.basename(url)
             file_path = os.path.join(temp_dir, filename)
             
-            with open(file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            # Get total file size
+            total_size = int(response.headers.get('content-length', 0))
             
-            progress_queue.put(("status", f"Downloaded {filename}"))
+            with open(file_path, 'wb') as f:
+                if total_size == 0:
+                    f.write(response.content)
+                else:
+                    downloaded = 0
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            # Update download progress less frequently
+                            if total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                status_msg = f"Downloading {filename}: {percent:.1f}%"
+                                if self._should_update_status(status_msg):
+                                    progress_queue.put(("status", status_msg))
+            
+            # Validate the downloaded file
+            if not self._validate_download(file_path, url, progress_queue):
+                # Don't remove the file, just skip it for now
+                return None
+            
+            # Show success immediately
+            progress_queue.put(("status", f"Download complete and validated: {filename}"))
             return file_path
         
+        except requests.RequestException as e:
+            # Show errors immediately
+            error_msg = f"Error downloading {url}: {str(e)}. Will retry later."
+            progress_queue.put(("status", error_msg))
+            return None
         except Exception as e:
-            progress_queue.put(("status", f"Error downloading {url}: {str(e)}"))
+            # Show errors immediately
+            error_msg = f"Error saving download {url}: {str(e)}. Will retry later."
+            progress_queue.put(("status", error_msg))
             return None
     
     def _extract_file(self, file_path: str, temp_extract_dir: str,

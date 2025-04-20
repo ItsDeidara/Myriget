@@ -20,7 +20,7 @@ class AppConfig:
         
         # Default values
         self.links_file = os.path.join(self.config_dir, "links.json")
-        self.batch_size = 134
+        self.batch_size = 500
         self.batch_size_mb = 10000
         self.copy_timeout = 3600
         self.per_file_timeout = 300
